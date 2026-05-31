@@ -68,7 +68,12 @@ try {
   assert.ok(names.includes('listClients') && names.includes('getConnectionInfo'), 'built-in tools present');
   assert.ok(!names.includes('echo'), 'no surface tools before a page connects');
 
-  // ── 2. Token rejection ──
+  // ── 2a. PNA preflight grant (lets a secure public origin reach loopback) ──
+  const pre = await fetch(`http://localhost:${port}/connect`, { method: 'OPTIONS', headers: { 'Access-Control-Request-Private-Network': 'true', 'Origin': 'https://gentropic.org' } });
+  assert.equal(pre.headers.get('access-control-allow-private-network'), 'true', 'PNA grant header on preflight');
+  assert.equal(pre.headers.get('access-control-allow-origin'), '*', 'CORS allow-origin on preflight');
+
+  // ── 2b. Token rejection ──
   const badConnect = await fetch(`http://localhost:${port}/connect`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ protocol: 1, token: 'wrong', title: 'X', name: 'evil', path: 'http://x/' }),

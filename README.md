@@ -89,6 +89,14 @@ the surface advertises.
 WebSocket first; automatic HTTP long-poll fallback on `file://` origins (where
 browsers block WS). Force one with a suffix: `port:token:http` or `port:token:ws`.
 
+**Public https origins** (gentropic.org/weir, installed PWA) can't reach
+`ws://localhost` — Chromium's Private/Local Network Access gates public→loopback.
+Inject the `@gcu/bridge` extension's brokered fetch — `gcuWebMCP.fetch = gcuFetch`
+— and the shim forces the HTTP transport through the extension, sidestepping the
+gate (the same path weir uses for Lemonade). The bridge also sends
+`Access-Control-Allow-Private-Network: true` so a *secure* origin can reach
+loopback directly with the browser's one-time permission. See [SPEC §4.1](SPEC.md).
+
 ## Security model in one line
 
 The token stops random web pages from driving your localhost bridge; **per-app

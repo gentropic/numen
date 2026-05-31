@@ -132,6 +132,30 @@ built-in tools the bridge answers itself: `listClients` and `getConnectionInfo`.
 A `client` parameter is injected into surface tools **only when >1 surface is
 connected** (single-app bridges keep clean schemas).
 
+### 4.1 Transport selection & public origins
+
+The shim picks a transport: **WS first, HTTP long-poll fallback** (the fallback
+fires on `file://`, where browsers block WS). But a page served from a **public
+https origin** (gentropic.org/weir, or the installed PWA — same origin) can't
+reach `ws://localhost` at all: Chromium's **Local/Private Network Access** gates
+public→loopback, and the WS upgrade can't carry the required preflight. Two
+answers, both already wired:
+
+- **Inject `gcuFetch`** — `gcuWebMCP.fetch = gcuFetch` (the `@gcu/bridge`
+  extension's brokered fetch, the same one weir uses for Lemonade). Injecting a
+  fetch **forces the HTTP transport** and routes `/connect`·`/send`·`/poll`
+  through the extension, which isn't subject to the *page's* PNA gate. This is the
+  primary path for the deployed PWA.
+- **PNA preflight grant** — for the no-extension fallback, the bridge sends
+  `Access-Control-Allow-Private-Network: true` on preflights, so a **secure**
+  public origin *may* reach loopback directly (subject to the browser's one-time
+  "allow local network" permission — which weir's Lemonade connection already
+  goes through). A plain `http` page origin can't: PNA requires a secure
+  initiator.
+
+Caveat to verify in production: a `GET /poll` is held ~25s; if `gcuFetch`/the
+extension imposes a shorter timeout, shorten `HTTP_POLL_TIMEOUT` on the bridge.
+
 ---
 
 ## 5. Tokens, ports, consent

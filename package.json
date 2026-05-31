@@ -10,7 +10,8 @@
   "files": ["webmcp-bridge.js", "shim.js", "SPEC.md", "README.md"],
   "scripts": {
     "info": "node webmcp-bridge.js --info",
-    "smoke": "node tools/smoke.mjs"
+    "smoke": "node tools/smoke.mjs",
+    "e2e": "node tools/e2e-browser.mjs"
   },
   "keywords": ["mcp", "webmcp", "claude", "model-context-protocol", "gcu", "local-first"],
   "engines": { "node": ">=18" }

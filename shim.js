@@ -10,6 +10,15 @@
 // Connect: gcuWebMCP.connect("PORT:TOKEN")  (the page usually stores PORT:TOKEN
 // in its own config after a one-time paste, then reconnects silently). Or append
 // #mcp=PORT:TOKEN to the URL. Set gcuWebMCP.name to a stable per-app id ("weir").
+//
+// Public-origin transport: a page served from a PUBLIC https origin (e.g.
+// gentropic.org/weir) can't reach ws://localhost — Chromium's Local/Private
+// Network Access gates public→loopback, and the WS upgrade can't carry the
+// preflight. Set `gcuWebMCP.fetch = gcuFetch` (the @gcu/bridge extension's
+// brokered fetch, the same one weir uses for Lemonade) and the shim routes its
+// HTTP long-poll transport through it, sidestepping the page-origin gate.
+// Injecting a fetch forces the HTTP transport (WS is skipped). On localhost/
+// file:// dev, leave it unset and WS/direct-HTTP are used.
 
 (function () {
   var PROTOCOL = 1;
@@ -22,6 +31,11 @@
   var _reconnectTimer = null;
   var _name = null;
   var _onStateChange = null;
+  var _fetch = null;                // injected fetch for the HTTP transport (e.g. gcuFetch)
+
+  // HTTP-transport fetch: the injected one if set, else the global. Injecting one
+  // also forces the HTTP transport (see _connect) — that's the public-origin path.
+  function _doFetch(url, opts) { return (_fetch || fetch)(url, opts); }
 
   function _setState(s) {
     _state = s;
@@ -92,7 +106,7 @@
   function _httpSend(obj) {
     if (!_transport || _transport.type !== 'http') return;
     var t = _transport;
-    fetch('http://localhost:' + t.port + '/send', {
+    _doFetch('http://localhost:' + t.port + '/send', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: t.token, id: t.id, message: obj }),
     }).catch(function () { /* poll will detect disconnect */ });
@@ -100,7 +114,7 @@
 
   function _connectHttp(port, token) {
     _setState('connecting');
-    return fetch('http://localhost:' + port + '/connect', {
+    return _doFetch('http://localhost:' + port + '/connect', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ protocol: PROTOCOL, token: token, title: (typeof document !== 'undefined' && document.title) || 'Untitled', name: _effectiveName(), path: (typeof location !== 'undefined' && location.href) || '' }),
     }).then(function (r) { return r.json(); }).then(function (data) {
@@ -116,7 +130,7 @@
   function _pollLoop() {
     if (!_transport || _transport.type !== 'http' || !_transport.polling) return;
     var t = _transport;
-    fetch('http://localhost:' + t.port + '/poll?token=' + encodeURIComponent(t.token) + '&id=' + encodeURIComponent(t.id))
+    _doFetch('http://localhost:' + t.port + '/poll?token=' + encodeURIComponent(t.token) + '&id=' + encodeURIComponent(t.id))
       .then(function (r) { return r.json(); })
       .then(function (messages) {
         if (!Array.isArray(messages)) return;
@@ -157,7 +171,8 @@
     clearTimeout(_reconnectTimer);
 
     _setState('connecting');
-    var useHttp = forceHttp || (typeof location !== 'undefined' && location.protocol === 'file:');
+    // Injected fetch (gcuFetch) ⇒ public origin ⇒ HTTP transport (WS can't be brokered).
+    var useHttp = forceHttp || !!_fetch || (typeof location !== 'undefined' && location.protocol === 'file:');
     (useHttp ? _connectHttp(port, token) : _connectWs(port, token).catch(function () { return _connectHttp(port, token); }))
       .catch(function (e) {
         console.error('[gcu-webmcp] connection failed:', e.message || e);
@@ -216,6 +231,8 @@
     set name(v) { _name = v || null; },
     get derivedName() { return _derivedName(); },
     set onStateChange(fn) { _onStateChange = fn; },
+    get fetch() { return _fetch; },
+    set fetch(fn) { _fetch = fn || null; },   // inject gcuFetch for public-origin → localhost
   };
   if (typeof window !== 'undefined') {
     window.gcuWebMCP = api;

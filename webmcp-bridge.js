@@ -137,6 +137,7 @@ function sendToClient(client, msg) {
 function handleClientMessage(clientId, msg) {
   const client = clients.get(clientId);
   if (!client) return;
+  if (process.env.GCU_WEBMCP_DEBUG) stderr(`recv ${clientId} ${msg && msg.type}`);
 
   if (msg.type === 'tools_changed') {
     clearTimeout(client.staleTimer);
@@ -305,6 +306,11 @@ function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  // Private Network Access: let a SECURE public origin (https://gentropic.org/weir)
+  // reach this loopback bridge directly — Chromium gates public→loopback and
+  // requires the server to opt in on the preflight. (The @gcu/bridge extension
+  // path sidesteps PNA entirely; this header is for the no-extension fallback.)
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
 }
 
 function jsonResponse(res, status, body) {
