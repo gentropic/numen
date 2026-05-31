@@ -230,6 +230,12 @@
     get name() { return _effectiveName(); },
     set name(v) { _name = v || null; },
     get derivedName() { return _derivedName(); },
+    get tools() { var n = []; _tools.forEach(function (t) { n.push(t.name); }); return n; },   // registered tool names (introspection)
+    invoke: function (name, input) {   // run a registered tool locally (testing / "try it" UIs)
+      var t = _tools.get(name);
+      if (!t) return Promise.reject(new Error('no such tool: ' + name));
+      return Promise.resolve(t.execute(input || {}, { requestUserInteraction: function (cb) { return cb(); } }));
+    },
     set onStateChange(fn) { _onStateChange = fn; },
     get fetch() { return _fetch; },
     set fetch(fn) { _fetch = fn || null; },   // inject gcuFetch for public-origin → localhost
