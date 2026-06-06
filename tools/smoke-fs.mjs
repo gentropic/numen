@@ -1,8 +1,13 @@
 // smoke-fs.mjs — proves the `fs` transport core (fs-channel.js) end to end, zero
 // deps, no browser, no port. Two FsChannel peers share one temp dir: a BRIDGE peer
-// and a PAGE peer. Drives the full handshake + a tool round-trip, then attacks the
-// signed-sentinel framing (tamper, replay, partial sync) and asserts each fails
-// closed. See TRANSPORTS.md §3–4.
+// and a PAGE peer. Drives the full handshake + a tool round-trip, attacks the
+// signed-sentinel framing (tamper, partial sync, replay) asserting each fails
+// closed, then reconnects a fresh page (the browser-reload case) and asserts the
+// stale epoch is swept. See TRANSPORTS.md §3–4.
+//
+// NOTE: one shared dir with atomic rename — this proves the protocol LOGIC, not a
+// real sync engine. The cross-machine hazards (partial/reordered/replayed frames)
+// are exercised by hand-crafting them below.
 //
 // Run: node tools/smoke-fs.mjs   (exit 0 = pass)
 
@@ -28,97 +33,114 @@ function makeNodeDir(root) {
   const P = (name) => join(root, name);
   return {
     async read(name) { try { return await readFile(P(name), 'utf8'); } catch { return null; } },
-    // atomic on a single fs: write a temp then rename (so a reader never sees a partial file)
+    // atomic on a single fs: write a temp then rename (a reader never sees a partial file)
     async write(name, str) { const f = P(name); await writeFile(f + '.tmp', str); await rename(f + '.tmp', f); },
     async list(dir) { try { return await readdir(P(dir)); } catch { return []; } },
     async remove(name) { try { await rm(P(name)); } catch { /* missing */ } },
     async mkdirp(dir) { await mkdir(P(dir), { recursive: true }); },
+    async rmrf(dir) { try { await rm(P(dir), { recursive: true, force: true }); } catch { /* missing */ } },
   };
 }
 
-// pump both peers until `done()` or a tick cap
-async function pump(a, b, done, max = 40) {
-  for (let i = 0; i < max; i++) {
-    await a.tick(); await b.tick();
-    if (done()) return true;
-  }
+async function pump(a, b, done, max = 60) {
+  for (let i = 0; i < max; i++) { await a.tick(); await b.tick(); if (done()) return true; }
   return done();
 }
 
 async function main() {
   const root = await mkdtemp(join(tmpdir(), 'webmcp-fs-'));
   const dir = makeNodeDir(root);
+  let results = 0;   // tool_results the bridge has received (across connections)
 
-  // ── 1. full round-trip: hello → welcome → tools_changed → tool_invoke → tool_result ──
+  function makeBridge() {
+    const b = new FsChannel({
+      role: 'bridge', dir, hmac, randomId,
+      onMessage(m) {
+        if (m.type === 'hello') b.send({ type: 'welcome', id: 'page-1', protocol: FS_VERSION });
+        else if (m.type === 'tools_changed') b.send({ type: 'tool_invoke', callId: 'c' + results, name: 'ping', input: { n: 7 } });
+        else if (m.type === 'tool_result') { b._lastResult = m; results++; }
+      },
+    });
+    return b;
+  }
+  function makePage(tag) {
+    const seen = [];
+    const p = new FsChannel({
+      role: 'page', dir, hmac, randomId,
+      onMessage(m) {
+        seen.push(m.type);
+        if (m.type === 'welcome') p.send({ type: 'tools_changed', tools: [{ name: 'ping' }] });
+        else if (m.type === 'tool_invoke') p.send({ type: 'tool_result', callId: m.callId, result: { pong: m.input.n * 2 } });
+      },
+    });
+    p._seen = seen;
+    return p;
+  }
+
+  // ── 1. full round-trip ──
   console.log('round-trip:');
-  const seen = { welcome: false, invoke: false, result: null, page: [] };
-
-  const bridge = new FsChannel({
-    role: 'bridge', dir, hmac, randomId,
-    onMessage(m) {
-      if (m.type === 'hello') bridge.send({ type: 'welcome', id: 'page-1', protocol: FS_VERSION });
-      else if (m.type === 'tools_changed') bridge.send({ type: 'tool_invoke', callId: 'c1', name: 'ping', input: { n: 7 } });
-      else if (m.type === 'tool_result') seen.result = m;
-    },
-  });
-  const page = new FsChannel({
-    role: 'page', dir, hmac, randomId,
-    onMessage(m) {
-      seen.page.push(m.type);
-      if (m.type === 'welcome') { seen.welcome = true; page.send({ type: 'tools_changed', tools: [{ name: 'ping' }] }); }
-      else if (m.type === 'tool_invoke') { seen.invoke = true; page.send({ type: 'tool_result', callId: m.callId, result: { pong: m.input.n * 2 } }); }
-    },
-  });
-
+  const bridge = makeBridge();
+  const page = makePage('p1');
   await bridge.start();
-  page.send({ type: 'hello', name: 'weir', path: 'test' });   // queued before session exists
+  page.send({ type: 'hello', name: 'weir', path: 'test' });   // queued before session/epoch exist
   await page.start();
-
-  await pump(bridge, page, () => seen.result);
-  ok(seen.welcome, 'page received welcome');
-  ok(seen.invoke, 'page received tool_invoke');
-  ok(seen.result && seen.result.callId === 'c1', 'bridge received tool_result for the right callId');
-  ok(seen.result && seen.result.result && seen.result.result.pong === 14, 'payload round-tripped intact (7 → 14)');
-  ok(JSON.stringify(seen.page) === JSON.stringify(['welcome', 'tool_invoke']), 'page delivered in order, exactly once');
+  await pump(bridge, page, () => results >= 1);
+  ok(page._seen.includes('welcome'), 'page received welcome');
+  ok(page._seen.includes('tool_invoke'), 'page received tool_invoke');
+  ok(bridge._lastResult && bridge._lastResult.result.pong === 14, 'payload round-tripped intact (7 → 14)');
+  ok(JSON.stringify(page._seen) === JSON.stringify(['welcome', 'tool_invoke']), 'page delivered in order, exactly once');
   ok(page.state === 'open' && bridge.state === 'open', 'both peers reached state=open');
 
-  // ── 2. tamper: a frame with a bad signature is NOT delivered ──
+  const sess = page.session, ep = page.epoch;
+  const toPage = `sessions/${sess}/${ep}/to-page`;           // bridge's outbox → the page reads it
+  const nextSeq = page._lastIn + 1;                          // the next seq the page will accept
+
+  // helper: craft a frame straight into the page's inbox (simulating the bridge).
+  // Uses a live ts so the freshness gate passes — the attacks under test are bad
+  // sig / short payload / replayed seq, NOT staleness.
+  async function craft(seq, msgObj, { sig, len } = {}) {
+    const payload = JSON.stringify(msgObj);
+    const ts = Date.now();
+    const realSig = await hmac(`${FS_VERSION}|${sess}|${ep}|to-page|${seq}|${ts}|${payload.length}|${payload}`);
+    await dir.write(`${toPage}/${seq}.json`, len === 'short' ? payload.slice(0, -2) : payload);
+    await dir.write(`${toPage}/${seq}.ready`, JSON.stringify({ v: FS_VERSION, session: sess, epoch: ep, dir: 'to-page', seq, ts, len: payload.length, sig: sig || realSig }));
+  }
+
+  // ── 2. tamper: bad signature at the next expected seq → not delivered ──
   console.log('tamper rejection:');
-  const sess = bridge.session;
-  const tdir = `sessions/${sess}/to-page`;          // bridge's outbox → page reads it
-  const badSeq = 99, ts = Date.now(), payload = JSON.stringify({ type: 'tool_invoke', callId: 'evil', name: 'ping', input: {} });
-  await dir.write(`${tdir}/${badSeq}.json`, payload);
-  await dir.write(`${tdir}/${badSeq}.ready`, JSON.stringify({ v: FS_VERSION, session: sess, dir: 'to-page', seq: badSeq, ts, len: payload.length, sig: 'deadbeef' }));
-  const before = seen.page.length;
-  await page.tick(); await page.tick();
-  ok(seen.page.length === before, 'forged frame (bad HMAC) was not delivered');
+  await craft(nextSeq, { type: 'tool_invoke', callId: 'evil', name: 'ping', input: {} }, { sig: 'deadbeef' });
+  const beforeTamper = page._seen.length;
+  await page.tick();
+  ok(page._seen.length === beforeTamper, 'forged frame (bad HMAC) was not delivered');
+  ok(page._lastIn + 1 === nextSeq, 'cursor did not advance past the forged frame');
 
-  // ── 3. partial sync: sentinel present, payload short → wait, then complete → deliver ──
+  // ── 3. partial sync: sentinel + short payload → wait; complete → deliver ──
   console.log('partial-sync tolerance:');
-  const pseq = bridge._outSeq;                       // next legit bridge seq
-  const good = JSON.stringify({ type: 'ping' });
-  const sig = await hmac(`${FS_VERSION}|${sess}|to-page|${pseq}|${ts}|${good.length}|${good}`);
-  // write the sentinel + a TRUNCATED payload first (simulates payload not fully synced)
-  await dir.write(`${tdir}/${pseq}.json`, good.slice(0, good.length - 2));
-  await dir.write(`${tdir}/${pseq}.ready`, JSON.stringify({ v: FS_VERSION, session: sess, dir: 'to-page', seq: pseq, ts, len: good.length, sig }));
-  const pingsBefore = seen.page.filter((t) => t === 'ping').length;
+  await craft(nextSeq, { type: 'ping' }, { len: 'short' });
+  const beforePartial = page._seen.length;
   await page.tick();
-  ok(seen.page.filter((t) => t === 'ping').length === pingsBefore, 'short payload held back (len mismatch)');
-  await dir.write(`${tdir}/${pseq}.json`, good);      // payload finishes syncing
-  page._outSeq = pseq + 1;                            // keep the real bridge from colliding on this seq
+  ok(page._seen.length === beforePartial, 'short payload held back (len mismatch)');
+  await craft(nextSeq, { type: 'ping' });                    // payload finishes syncing (full + good sig)
   await page.tick();
-  ok(seen.page.filter((t) => t === 'ping').length === pingsBefore + 1, 'frame delivered once the payload completed');
+  ok(page._seen[page._seen.length - 1] === 'ping', 'frame delivered once the payload completed');
 
-  // ── 4. replay: re-materialize a consumed frame → NOT re-delivered ──
+  // ── 4. replay: re-materialize the consumed frame → not re-delivered ──
   console.log('replay rejection:');
-  const rseq = pseq;                                 // the seq we just consumed (now <= lastIn)
-  await dir.write(`${tdir}/${rseq}.json`, good);
-  await dir.write(`${tdir}/${rseq}.ready`, JSON.stringify({ v: FS_VERSION, session: sess, dir: 'to-page', seq: rseq, ts: Date.now(), len: good.length, sig }));
-  const pingsNow = seen.page.filter((t) => t === 'ping').length;
+  const pingsNow = page._seen.filter((t) => t === 'ping').length;
+  await craft(nextSeq, { type: 'ping' });                    // same (already-consumed) seq reappears
   await page.tick();
-  ok(seen.page.filter((t) => t === 'ping').length === pingsNow, 'replayed (already-consumed seq) frame was not re-delivered');
-  const left = await dir.list(`${tdir}`);
-  ok(!left.some((n) => n === `${rseq}.ready`), 'replayed frame was swept');
+  ok(page._seen.filter((t) => t === 'ping').length === pingsNow, 'replayed (already-consumed seq) frame was not re-delivered');
+  ok(!(await dir.list(toPage)).includes(`${nextSeq}.ready`), 'replayed frame was swept');
+
+  // ── 5. reconnect: a fresh page (browser reload) handshakes anew; stale epoch swept ──
+  console.log('reconnect:');
+  const page2 = makePage('p2');
+  page2.send({ type: 'hello', name: 'weir', path: 'test' });
+  await page2.start();
+  await pump(bridge, page2, () => results >= 2);
+  ok(results >= 2, 'second connection completed a fresh tool round-trip');
+  ok(page2.epoch !== ep, 'reconnect minted a new epoch');
+  ok(!(await dir.list(`sessions/${sess}`)).includes(ep), 'bridge swept the stale (old-reload) epoch dir');
 
   await rm(root, { recursive: true, force: true });
 }

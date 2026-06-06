@@ -5,25 +5,38 @@
 // filesystem, crypto, or browser:
 //
 //   dir       async { read(name)->str|null, write(name,str), list(dir)->[name],
-//                     remove(name), mkdirp(dir) }     — name/dir are '/'-relative paths
-//   hmac      async (str) -> hex                      — key is bound by the caller
-//                                                       (HKDF of the machine token);
-//                                                       key material NEVER enters here
+//                     remove(name), mkdirp(dir), rmrf(dir) }   — names are '/'-paths
+//   hmac      async (str) -> hex          — key bound by the caller (HKDF of the
+//                                            machine token); key material NEVER here
 //   now       () -> epoch ms
-//   randomId  () -> hex string                        — session nonce source (bridge)
-//   onMessage (wireMsg) -> void                       — deliver a verified inbound msg
+//   randomId  () -> hex string            — session (bridge) / epoch (page) nonces
+//   onMessage (wireMsg) -> void           — deliver a verified inbound message
 //   onState   ('connecting'|'open'|'closed') -> void
 //
-// Roles: the BRIDGE announces (writes `bridge.live`); the PAGE dials. Duplex — each
-// side appends signed frames to its own outbox and consumes the peer's. A frame is
-// `‹seq›.json` (payload) + `‹seq›.ready` (signed sentinel). The sentinel proves the
-// payload COMPLETE and AUTHENTIC in one check (§3.3): partial sync, reordered
-// delivery, tamper, and replay all fail closed. Delivery is in-order, exactly-once.
+// Roles: the BRIDGE announces (writes `bridge.live`); the PAGE dials. Layout:
 //
-// The host drives time: call tick() on an interval (the bridge/shim) or in a loop
-// (the smoke). The channel carries the existing wire message set verbatim
-// (hello/welcome/tools_changed/tool_invoke/tool_result/notification/ping/pong) and
+//   bridge.live                                     signed announce (session + ts)
+//   sessions/<session>/<epoch>/to-page/   ‹seq›.json ‹seq›.ready   bridge → page
+//   sessions/<session>/<epoch>/to-bridge/ ‹seq›.json ‹seq›.ready   page → bridge
+//
+// `<session>` is minted by the bridge per start (a restart = a new session). The
+// `<epoch>` is minted by the PAGE per connect, so a browser reload reconnects on a
+// fresh epoch instead of colliding seq counters with the live session. The bridge
+// serves the freshest epoch and sweeps the rest (free cleanup).
+//
+// A frame is `‹seq›.json` (payload) + `‹seq›.ready` (signed sentinel). The sentinel
+// proves the payload COMPLETE and AUTHENTIC in one check (§3.3): partial sync,
+// reordered delivery, tamper, and replay all fail closed. Delivery is in-order,
+// exactly-once. The channel carries the existing wire message set verbatim and
 // knows nothing about tools.
+//
+// Liveness is PASSIVE (no per-tick heartbeat — writes over a sync folder are
+// expensive). A frame's `ts` is its own liveness proof; when idle, nobody writes.
+// The one periodic write is the bridge refreshing `bridge.live` slowly, so an idle
+// page can tell a live bridge from a stale one. The page is write-silent when idle.
+//
+// The host drives time: call tick() on an interval (bridge/shim) or in a loop
+// (smoke). The host MUST NOT overlap ticks (await one before the next).
 
 (function (root, factory) {
   var api = factory();
@@ -33,19 +46,21 @@
   'use strict';
 
   var FS_VERSION = 1;
-  var SKEW_MS = 5 * 60 * 1000;   // accept frames within ±5 min (freshness / replay window)
+  var SKEW_MS = 5 * 60 * 1000;        // frame freshness / replay window
+  var ANNOUNCE_INTERVAL_MS = 30000;   // bridge.live refresh cadence (the ONLY periodic write)
+  var LIVENESS_MS = 90000;            // page treats the bridge as down if bridge.live is older
 
   function outboxOf(role) { return role === 'bridge' ? 'to-page' : 'to-bridge'; }
   function inboxOf(role) { return role === 'bridge' ? 'to-bridge' : 'to-page'; }
 
-  // The signed string binds the envelope to the payload — swapping a sentinel onto a
-  // different payload, or editing any envelope field, breaks the HMAC.
-  function canon(session, dir, seq, ts, len, payload) {
-    return FS_VERSION + '|' + session + '|' + dir + '|' + seq + '|' + ts + '|' + len + '|' + payload;
+  // The signed string binds the envelope to the payload — editing any field, or
+  // moving a sentinel onto a different payload, breaks the HMAC.
+  function canon(session, epoch, dir, seq, ts, len, payload) {
+    return FS_VERSION + '|' + session + '|' + epoch + '|' + dir + '|' + seq + '|' + ts + '|' + len + '|' + payload;
   }
 
   function FsChannel(opts) {
-    this.role = opts.role;                 // 'bridge' | 'page'
+    this.role = opts.role;             // 'bridge' | 'page'
     this._dir = opts.dir;
     this._hmac = opts.hmac;
     this._now = opts.now || function () { return Date.now(); };
@@ -54,10 +69,12 @@
     this._onState = opts.onState || function () {};
     this._log = opts.log || function () {};
     this.session = null;
+    this.epoch = null;
     this.state = 'connecting';
     this._outSeq = 0;
-    this._lastIn = -1;                     // highest inbound seq delivered (replay/order guard)
+    this._lastIn = -1;                 // highest inbound seq delivered (replay/order guard)
     this._outQueue = [];
+    this._lastAnnounce = 0;
   }
 
   FsChannel.prototype._setState = function (s) {
@@ -66,48 +83,78 @@
     try { this._onState(s); } catch (e) { /* host callback */ }
   };
 
-  FsChannel.prototype._sessDir = function (sub) { return 'sessions/' + this.session + '/' + sub; };
+  FsChannel.prototype._epochDir = function (sub) { return 'sessions/' + this.session + '/' + this.epoch + '/' + sub; };
+
+  // Reset the per-connection counters (on a new session or a new adopted epoch).
+  FsChannel.prototype._resetConn = function () { this._outSeq = 0; this._lastIn = -1; };
 
   // ── start ──
 
   FsChannel.prototype.start = async function () {
     if (this.role === 'bridge') {
       this.session = this._rand();
-      await this._dir.mkdirp(this._sessDir('to-page'));
-      await this._dir.mkdirp(this._sessDir('to-bridge'));
-      await this._announce();
+      await this._announce();          // page can't dial until bridge.live exists
     }
-    // page discovers lazily on the first tick()
+    // page discovers (and mints its epoch) on the first tick()
   };
+
+  // ── bridge: announce (the one periodic write) ──
 
   FsChannel.prototype._announce = async function () {
     var ts = this._now();
-    var body = { v: FS_VERSION, session: this.session, ts: ts };
-    var payload = JSON.stringify(body);
-    var sig = await this._hmac(canon(this.session, 'announce', 0, ts, payload.length, payload));
-    await this._dir.write('bridge.live', JSON.stringify({ body: body, sig: sig }));
+    var payload = JSON.stringify({ v: FS_VERSION, session: this.session, ts: ts });
+    var sig = await this._hmac(canon(this.session, '-', 'announce', 0, ts, payload.length, payload));
+    await this._dir.write('bridge.live', JSON.stringify({ payload: payload, sig: sig }));  // sign the RAW string
+    this._lastAnnounce = ts;
   };
 
-  // Page: read + verify bridge.live, adopt its session (re-handshaking if it changed).
+  // bridge: adopt the freshest connection epoch (a page reload = a new epoch) and
+  // sweep the others. Resets the per-connection counters when the epoch changes.
+  FsChannel.prototype._adoptEpoch = async function () {
+    var epochs = await this._dir.list('sessions/' + this.session);
+    var best = null, bestTs = -1;
+    for (var i = 0; i < epochs.length; i++) {
+      var ep = epochs[i];
+      var raw = await this._dir.read('sessions/' + this.session + '/' + ep + '/to-bridge/0.ready');  // the hello sentinel
+      if (raw == null) continue;
+      var s; try { s = JSON.parse(raw); } catch (e) { continue; }
+      if (s && typeof s.ts === 'number' && s.ts > bestTs) { bestTs = s.ts; best = ep; }
+    }
+    if (best && best !== this.epoch) {
+      this.epoch = best;
+      this._resetConn();
+      await this._dir.mkdirp(this._epochDir('to-page'));
+    }
+    // sweep stale epoch dirs (previous reloads); never the one we serve
+    for (var j = 0; j < epochs.length; j++) {
+      if (epochs[j] !== this.epoch) await this._dir.rmrf('sessions/' + this.session + '/' + epochs[j]);
+    }
+  };
+
+  // page: read + verify bridge.live; adopt the session (minting a fresh epoch) when
+  // it first appears or changes. Returns false if no live, unverifiable, or stale
+  // bridge (→ the bridge is presumed down).
   FsChannel.prototype._discover = async function () {
     var raw = await this._dir.read('bridge.live');
-    if (!raw) return false;
+    if (raw == null) return false;
     var ann; try { ann = JSON.parse(raw); } catch (e) { return false; }
-    if (!ann || !ann.body || ann.body.v !== FS_VERSION) return false;
-    var b = ann.body, payload = JSON.stringify(b);
-    var expect = await this._hmac(canon(b.session, 'announce', 0, b.ts, payload.length, payload));
+    if (!ann || typeof ann.payload !== 'string') return false;
+    var b; try { b = JSON.parse(ann.payload); } catch (e) { return false; }
+    if (!b || b.v !== FS_VERSION) return false;
+    var expect = await this._hmac(canon(b.session, '-', 'announce', 0, b.ts, ann.payload.length, ann.payload));
     if (expect !== ann.sig) { this._log('bad announce sig'); return false; }
-    if (Math.abs(this._now() - b.ts) > SKEW_MS) { this._log('stale announce'); return false; }
-    if (this.session !== b.session) {           // first / new session → (re)handshake
+    if (this._now() - b.ts > LIVENESS_MS) { this._log('bridge.live stale — bridge presumed down'); return false; }
+    if (this.session !== b.session) {            // first sight or a bridge restart → fresh connection
       this.session = b.session;
-      this._outSeq = 0; this._lastIn = -1;
-      await this._dir.mkdirp(this._sessDir('to-bridge'));
-      await this._dir.mkdirp(this._sessDir('to-page'));
+      this.epoch = this._rand();
+      this._resetConn();
+      await this._dir.mkdirp(this._epochDir('to-bridge'));
+      await this._dir.mkdirp(this._epochDir('to-page'));
     }
     return true;
   };
 
-  // ── send (queued; flushed by tick once a session exists) ──
+  // ── send (queued; flushed by tick once a session+epoch exist) ──
 
   FsChannel.prototype.send = function (msg) { this._outQueue.push(msg); };
 
@@ -116,11 +163,11 @@
     var seq = this._outSeq++;
     var ts = this._now();
     var payload = JSON.stringify(msg);
-    var sig = await this._hmac(canon(this.session, dir, seq, ts, payload.length, payload));
-    var base = this._sessDir(dir) + '/' + seq;
-    await this._dir.write(base + '.json', payload);      // payload first…
-    await this._dir.write(base + '.ready', JSON.stringify({   // …then the sentinel
-      v: FS_VERSION, session: this.session, dir: dir, seq: seq, ts: ts, len: payload.length, sig: sig,
+    var sig = await this._hmac(canon(this.session, this.epoch, dir, seq, ts, payload.length, payload));
+    var base = this._epochDir(dir) + '/' + seq;
+    await this._dir.write(base + '.json', payload);            // payload first…
+    await this._dir.write(base + '.ready', JSON.stringify({    // …then the sentinel
+      v: FS_VERSION, session: this.session, epoch: this.epoch, dir: dir, seq: seq, ts: ts, len: payload.length, sig: sig,
     }));
   };
 
@@ -132,7 +179,7 @@
   // Consume the peer's outbox: verify + deliver in seq order, exactly once.
   FsChannel.prototype._drainInbox = async function () {
     var dir = inboxOf(this.role);
-    var dpath = this._sessDir(dir);
+    var dpath = this._epochDir(dir);
     var names = await this._dir.list(dpath);
     var readys = [];
     for (var i = 0; i < names.length; i++) {
@@ -149,13 +196,13 @@
 
       var rawR = await this._dir.read(base + '.ready');
       if (rawR == null) continue;
-      var sent; try { sent = JSON.parse(rawR); } catch (e) { continue; }
-      if (!sent || sent.v !== FS_VERSION || sent.session !== this.session || sent.seq !== seq || sent.dir !== dir) break;
+      var sent; try { sent = JSON.parse(rawR); } catch (e) { continue; }     // torn sentinel → retry next tick
+      if (!sent || sent.v !== FS_VERSION || sent.session !== this.session || sent.epoch !== this.epoch || sent.seq !== seq || sent.dir !== dir) break;
       if (Math.abs(this._now() - sent.ts) > SKEW_MS) { this._log('stale frame ' + seq); await this._remove(base); break; }
 
       var payload = await this._dir.read(base + '.json');
       if (payload == null || payload.length !== sent.len) break;         // not fully synced yet → wait
-      var expect = await this._hmac(canon(this.session, dir, seq, sent.ts, sent.len, payload));
+      var expect = await this._hmac(canon(this.session, this.epoch, dir, seq, sent.ts, sent.len, payload));
       if (expect !== sent.sig) { this._log('bad frame sig ' + seq); await this._remove(base); break; }
 
       var msg; try { msg = JSON.parse(payload); } catch (e) { await this._remove(base); break; }
@@ -166,25 +213,21 @@
     }
   };
 
-  FsChannel.prototype._beat = async function () {
-    var ts = this._now();
-    var sig = await this._hmac(canon(this.session, outboxOf(this.role) + '/.alive', 0, ts, 0, ''));
-    await this._dir.write(this._sessDir(outboxOf(this.role)) + '/.alive', JSON.stringify({ ts: ts, sig: sig }));
-    if (this.role === 'bridge') await this._announce();                 // keep bridge.live fresh
-  };
-
-  // ── tick: one poll cycle (host schedules it) ──
+  // ── tick: one poll cycle (host schedules it; must not overlap) ──
 
   FsChannel.prototype.tick = async function () {
     if (this.state === 'closed') return;
-    if (this.role === 'page') {
+    if (this.role === 'bridge') {
+      if (this._now() - this._lastAnnounce > ANNOUNCE_INTERVAL_MS) await this._announce();  // slow refresh — the only periodic write
+      await this._adoptEpoch();
+      if (!this.epoch) return;                                           // no page has dialled yet
+    } else {
       var ok = await this._discover();
       if (!ok) { this._setState('connecting'); return; }
-      this._setState('open');                                           // the bridge is announcing
+      this._setState('open');                                            // the bridge is announcing
     }
-    if (!this.session) return;
+    if (!this.session || !this.epoch) return;
     while (this._outQueue.length) await this._writeFrame(this._outQueue.shift());
-    await this._beat();
     await this._drainInbox();
   };
 
