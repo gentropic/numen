@@ -158,17 +158,29 @@
 
   FsChannel.prototype.send = function (msg) { this._outQueue.push(msg); };
 
+  // Write one frame. The seq is committed and the caller dequeues ONLY on success —
+  // a transient FS error (lock contention, a momentary AV/sync lock) must not drop
+  // the message or burn the seq; it's retried with the same seq next tick. Returns
+  // true on success, false to retry. A half-write (payload ok, sentinel failed)
+  // leaves a harmless orphan `.json` the retry overwrites; readers key off `.ready`.
   FsChannel.prototype._writeFrame = async function (msg) {
     var dir = outboxOf(this.role);
-    var seq = this._outSeq++;
+    var seq = this._outSeq;                                    // tentative
     var ts = this._now();
     var payload = JSON.stringify(msg);
-    var sig = await this._hmac(canon(this.session, this.epoch, dir, seq, ts, payload.length, payload));
-    var base = this._epochDir(dir) + '/' + seq;
-    await this._dir.write(base + '.json', payload);            // payload first…
-    await this._dir.write(base + '.ready', JSON.stringify({    // …then the sentinel
-      v: FS_VERSION, session: this.session, epoch: this.epoch, dir: dir, seq: seq, ts: ts, len: payload.length, sig: sig,
-    }));
+    try {
+      var sig = await this._hmac(canon(this.session, this.epoch, dir, seq, ts, payload.length, payload));
+      var base = this._epochDir(dir) + '/' + seq;
+      await this._dir.write(base + '.json', payload);          // payload first…
+      await this._dir.write(base + '.ready', JSON.stringify({  // …then the sentinel
+        v: FS_VERSION, session: this.session, epoch: this.epoch, dir: dir, seq: seq, ts: ts, len: payload.length, sig: sig,
+      }));
+      this._outSeq = seq + 1;                                  // commit only on full success
+      return true;
+    } catch (e) {
+      this._log('write failed seq ' + seq + ': ' + ((e && e.message) || e));
+      return false;
+    }
   };
 
   FsChannel.prototype._remove = async function (base) {
@@ -227,7 +239,11 @@
       this._setState('open');                                            // the bridge is announcing
     }
     if (!this.session || !this.epoch) return;
-    while (this._outQueue.length) await this._writeFrame(this._outQueue.shift());
+    while (this._outQueue.length) {
+      var wrote = await this._writeFrame(this._outQueue[0]);
+      if (!wrote) break;                  // transient write failure → keep it queued, retry next tick
+      this._outQueue.shift();
+    }
     await this._drainInbox();
   };
 

@@ -49,7 +49,7 @@ is configured) → `fs`; else WS first; else HTTP long-poll.**
 |---|---|---|---|---|
 | `ws` | `ws://localhost:<port>` | port | token in `hello` | shipped |
 | `http` | localhost long-poll | port | token in `hello` | shipped (file:// / PNA) |
-| `fs` | a shared directory | **folder** | **HMAC per frame** (§4) | **this doc, v1** |
+| `fs` | a shared directory | **folder** | **HMAC per frame** (§4) | **v1 shipped (bridge + shim)** |
 | `webrtc` | data channel, folder-signalled | folder→then P2P | DTLS + handshake HMAC | **v1.5 seam (§7)** |
 
 `ws`/`http` are unchanged. The rest of this doc is `fs`, with the `webrtc` seam.
@@ -322,6 +322,29 @@ surface-agnostic — it relays frames and merges the tool list the page sends. S
   folder is a real edge (double-consume); v1 assumes one bridge per exchange and a
   second logs a warning.
 
+### 6.1 The shim (page) side — `fs-channel.js` + an FSA adapter
+
+`shim.js` selects the `fs` transport when a directory handle is injected —
+`gcuWebMCP.folder = <FileSystemDirectoryHandle>` (the way `gcuWebMCP.fetch =
+gcuFetch` forces HTTP today) — and `gcuWebMCP.connect("<machine-token>")` with a
+**bare token** (no port). Internals:
+
+- **Reuses `fs-channel.js`** (role `page`). The shim is a plain IIFE that can't
+  `import`, so `fs-channel.js` attaches `globalThis.GcuFsChannel` when not in
+  CommonJS; the app build must **load it on the page alongside the shim** (concat /
+  vendor as source). If absent, the shim errors clearly on connect.
+- **FSA dir-adapter** maps the channel's `/`-path interface onto the handle
+  (walking `getDirectoryHandle`). FSA has **no atomic rename**, but the signed
+  sentinel makes that unnecessary — a half-written `createWritable` payload fails
+  its len/HMAC and the reader waits. Writes `close()` in a `finally` (release the
+  OPFS/FSA write lock even on error), and a failed frame write is **retried, not
+  dropped** (the seq commits only on success — a transient lock/AV/sync error must
+  not burn a seq and wedge the channel).
+- **Key derivation** matches the bridge exactly via `crypto.subtle`: `HKDF(token,
+  salt='', info='webmcp-fs|'+gcuWebMCP.name)` → HMAC-SHA256 → hex. Needs a secure
+  context (https / localhost / file://); the page derives the same key the bridge
+  did from the same token + app id.
+
 ---
 
 ## 7. WebRTC upgrade — v1.5 seam (spec now, build next)
@@ -365,11 +388,15 @@ is additive.
 
 ## 9. Scope & sequencing
 
-- **v1 — `fs` transport.** The interface (§1), the folder protocol (§3), the
-  security model (§4), the bridge `fs` backend (§6). Browser(FSA) ↔ agent(stdio
-  bridge), same-machine **and** sync'd, single peer. **Proven by:** Claude Code
-  calling `weir_queryItems` over a temp folder with **no extension and no port**,
-  as a zero-dep node smoke (alongside the existing `tools/smoke.mjs`).
+- **v1 — `fs` transport. ✅ shipped.** The interface (§1), the folder protocol
+  (§3), the security model (§4), the bridge `fs` backend (§6), the shim/FSA page
+  side (§6.1). Browser(FSA) ↔ agent(stdio bridge), same-machine **and** sync'd,
+  single peer. **Proven by:** `tools/smoke-fs.mjs` (protocol core, incl. reconnect +
+  tamper/partial/replay attacks), `tools/smoke-fs-bridge.mjs` (the REAL bridge over
+  a folder driven via MCP stdio — no port, no extension), and `tools/e2e-fs.mjs`
+  (the real shim in Chromium over OPFS — the browser-side FSA adapter + subtle
+  HKDF/HMAC). Node smokes are zero-dep + in `npm run smoke`; the browser e2e is
+  local-only (sibling Playwright), like `e2e-browser.mjs`.
 - **v1.5 — WebRTC upgrade** (§7), folder-signalled, opportunistic, STUN-only.
 - **v2 — hardening:** payload encryption option, multi-peer per folder, TURN, a
   shared consent helper (SPEC §10).

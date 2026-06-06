@@ -22,9 +22,10 @@
 
 (function () {
   var PROTOCOL = 1;
+  var FS_POLL_MS = 350;             // fs-transport poll cadence (reads are cheap; see TRANSPORTS §3.4)
 
   var _tools = new Map();
-  var _transport = null;            // { type: 'ws'|'http', ... }
+  var _transport = null;            // { type: 'ws'|'http'|'fs', ... }
   var _state = 'disconnected';      // disconnected | connecting | connected | error
   var _clientId = null;
   var _portAndToken = null;
@@ -32,6 +33,7 @@
   var _name = null;
   var _onStateChange = null;
   var _fetch = null;                // injected fetch for the HTTP transport (e.g. gcuFetch)
+  var _folder = null;               // injected FileSystemDirectoryHandle ⇒ forces the fs transport
 
   // HTTP-transport fetch: the injected one if set, else the global. Injecting one
   // also forces the HTTP transport (see _connect) — that's the public-origin path.
@@ -73,7 +75,18 @@
       if (_transport.ws && _transport.ws.readyState === WebSocket.OPEN) _transport.ws.send(JSON.stringify(obj));
     } else if (_transport.type === 'http') {
       _httpSend(obj);
+    } else if (_transport.type === 'fs') {
+      if (_transport.channel) _transport.channel.send(obj);
     }
+  }
+
+  function _teardownTransport() {
+    if (!_transport) return;
+    var t = _transport;
+    if (t.type === 'ws' && t.ws) { try { t.ws.close(); } catch (e) { /* ignore */ } }
+    if (t.type === 'http') t.polling = false;
+    if (t.type === 'fs') { t.polling = false; if (t.timer) clearInterval(t.timer); if (t.channel) t.channel.stop(); }
+    _transport = null;
   }
 
   // ── WebSocket transport ──
@@ -143,6 +156,104 @@
       });
   }
 
+  // ── fs transport (TRANSPORTS.md §3): a page-role FsChannel over an injected
+  // FileSystemDirectoryHandle. Reuses fs-channel.js (loaded on the page as the global
+  // GcuFsChannel, e.g. concatenated into the app build). No port, no extension. ──
+
+  function _fsChannelCtor() {
+    var g = (typeof GcuFsChannel !== 'undefined') ? GcuFsChannel
+      : (typeof window !== 'undefined' && window.GcuFsChannel) ? window.GcuFsChannel : null;
+    return g && g.FsChannel;
+  }
+
+  function _randHex(n) {
+    var a = new Uint8Array(n); crypto.getRandomValues(a);
+    var s = ''; for (var i = 0; i < a.length; i++) s += a[i].toString(16).padStart(2, '0');
+    return s;
+  }
+
+  // FSA dir-adapter: maps the FsChannel '/'-path interface onto a directory handle.
+  // FSA has no atomic rename — but the signed sentinel tolerates partial reads, so a
+  // plain createWritable is fine (a half-written payload fails its len/hmac and waits).
+  function _fsaDir(root) {
+    function parts(p) { return String(p).split('/').filter(Boolean); }
+    async function dirOf(segs, create) {
+      var h = root;
+      for (var i = 0; i < segs.length; i++) h = await h.getDirectoryHandle(segs[i], { create: !!create });
+      return h;
+    }
+    return {
+      async read(name) {
+        var p = parts(name), fn = p.pop();
+        try { var d = await dirOf(p, false); var fh = await d.getFileHandle(fn, { create: false }); return await (await fh.getFile()).text(); }
+        catch (e) { return null; }
+      },
+      async write(name, str) {
+        var p = parts(name), fn = p.pop();
+        var d = await dirOf(p, true);
+        var fh = await d.getFileHandle(fn, { create: true });
+        var w = await fh.createWritable();
+        try { await w.write(str); } finally { await w.close(); }   // always release the OPFS write lock
+      },
+      async list(dirp) {
+        try { var d = await dirOf(parts(dirp), false); var names = []; for await (var key of d.keys()) names.push(key); return names; }
+        catch (e) { return []; }
+      },
+      async remove(name) {
+        var p = parts(name), fn = p.pop();
+        try { var d = await dirOf(p, false); await d.removeEntry(fn); } catch (e) { /* missing */ }
+      },
+      async mkdirp(dirp) { await dirOf(parts(dirp), true); },
+      async rmrf(dirp) {
+        var p = parts(dirp), last = p.pop();
+        try { var d = await dirOf(p, false); await d.removeEntry(last, { recursive: true }); } catch (e) { /* missing */ }
+      },
+    };
+  }
+
+  // Derive the per-app HMAC key identically to the bridge: HKDF(token, salt='',
+  // info='webmcp-fs|<app id>'), then HMAC-SHA256 over the canonical string → hex.
+  async function _fsHmac(token, id) {
+    var enc = new TextEncoder();
+    var ikm = await crypto.subtle.importKey('raw', enc.encode(token), 'HKDF', false, ['deriveBits']);
+    var bits = await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: enc.encode('webmcp-fs|' + id) }, ikm, 256);
+    var key = await crypto.subtle.importKey('raw', bits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    return async function (str) {
+      var sig = await crypto.subtle.sign('HMAC', key, enc.encode(str));
+      var b = new Uint8Array(sig), hex = '';
+      for (var i = 0; i < b.length; i++) hex += b[i].toString(16).padStart(2, '0');
+      return hex;
+    };
+  }
+
+  async function _connectFs(token) {
+    var FsChannel = _fsChannelCtor();
+    if (!FsChannel) throw new Error('fs transport needs fs-channel.js (global GcuFsChannel) on the page');
+    if (!(crypto && crypto.subtle)) throw new Error('fs transport needs crypto.subtle (a secure context)');
+    _setState('connecting');
+    var hmac = await _fsHmac(token, _effectiveName());
+    var channel = new FsChannel({
+      role: 'page', dir: _fsaDir(_folder), hmac: hmac,
+      now: function () { return Date.now(); },
+      randomId: function () { return _randHex(8); },
+      onMessage: function (msg) { _handleMessage(msg); },
+      onState: function (s) { if (s === 'closed') _setState('disconnected'); },   // 'connected' is set on `welcome`
+    });
+    var t = { type: 'fs', channel: channel, token: token, polling: true, timer: null };
+    _transport = t;
+    channel.send({ type: 'hello', protocol: PROTOCOL, title: (typeof document !== 'undefined' && document.title) || 'Untitled', name: _effectiveName(), path: (typeof location !== 'undefined' && location.href) || '' });
+    channel.send({ type: 'tools_changed', tools: _serializeTools() });
+    await channel.start();
+    var busy = false;
+    t.timer = setInterval(function () {
+      if (busy || !t.polling) return;
+      busy = true;
+      Promise.resolve().then(function () { return channel.tick(); })
+        .catch(function (e) { if (typeof console !== 'undefined') console.error('[gcu-webmcp] fs tick', e); })
+        .then(function () { busy = false; });
+    }, FS_POLL_MS);
+  }
+
   // ── shared message handler ──
 
   function _handleMessage(msg) {
@@ -152,9 +263,25 @@
     else if (msg.type === 'error') { console.error('[gcu-webmcp]', msg.message); _setState('error'); }
   }
 
-  // ── connect (try WS, fall back to HTTP) ──
+  // ── connect (fs when a folder is injected; else try WS, fall back to HTTP) ──
 
   function _connect(portAndToken) {
+    // fs transport: a folder handle is injected and the connect datum is just the
+    // machine token (no port). The page derives the shared key from token + its name.
+    if (_folder) {
+      var fsToken = String(portAndToken || '').replace(/^fs:/, '').trim();
+      if (!fsToken) throw new Error('fs transport needs the machine token (gcuWebMCP.connect("<token>"))');
+      _portAndToken = portAndToken;
+      _teardownTransport();
+      clearTimeout(_reconnectTimer);
+      _connectFs(fsToken).catch(function (e) {
+        console.error('[gcu-webmcp] fs connection failed:', e.message || e);
+        _setState('error');
+        if (_portAndToken) _reconnectTimer = setTimeout(function () { _connect(_portAndToken); }, 5000);
+      });
+      return;
+    }
+
     if (typeof portAndToken !== 'string' || portAndToken.indexOf(':') === -1) throw new Error('Token required: use "port:token" format');
     var forceHttp = /:http$/.test(portAndToken);
     var connStr = (forceHttp || /:ws$/.test(portAndToken)) ? portAndToken.slice(0, portAndToken.lastIndexOf(':')) : portAndToken;
@@ -163,11 +290,7 @@
     var port = connStr.substring(0, idx);
     var token = connStr.substring(idx + 1);
 
-    if (_transport) {
-      if (_transport.type === 'ws' && _transport.ws) { try { _transport.ws.close(); } catch (e) { /* ignore */ } }
-      if (_transport.type === 'http') _transport.polling = false;
-      _transport = null;
-    }
+    _teardownTransport();
     clearTimeout(_reconnectTimer);
 
     _setState('connecting');
@@ -184,11 +307,7 @@
   function _disconnect() {
     _portAndToken = null;
     clearTimeout(_reconnectTimer);
-    if (_transport) {
-      if (_transport.type === 'ws' && _transport.ws) { try { _transport.ws.close(); } catch (e) { /* ignore */ } }
-      if (_transport.type === 'http') _transport.polling = false;
-      _transport = null;
-    }
+    _teardownTransport();
     _clientId = null;
     _setState('disconnected');
   }
@@ -239,6 +358,8 @@
     set onStateChange(fn) { _onStateChange = fn; },
     get fetch() { return _fetch; },
     set fetch(fn) { _fetch = fn || null; },   // inject gcuFetch for public-origin → localhost
+    get folder() { return _folder; },
+    set folder(h) { _folder = h || null; },   // inject a FileSystemDirectoryHandle ⇒ fs transport
   };
   if (typeof window !== 'undefined') {
     window.gcuWebMCP = api;
