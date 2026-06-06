@@ -37,6 +37,16 @@ function argVal(flag, fallback) {
   return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : fallback;
 }
 
+// Expand a leading ~ to the home dir (node does NOT do shell tilde expansion, and
+// .mcp.json args aren't shell-interpreted) — so a portable, committable, username-free
+// `--folder ~/webmcp/weir` works on every machine.
+function expandHome(p) {
+  if (!p) return p;
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+
 const APP_NAME = argVal('--app', '') || process.env.GCU_WEBMCP_APP || '';
 const PREFERRED_PORT = parseInt(argVal('--port', process.env.GCU_WEBMCP_PORT || '0'), 10) || 0;
 
@@ -44,8 +54,12 @@ const PREFERRED_PORT = parseInt(argVal('--port', process.env.GCU_WEBMCP_PORT || 
 // folder, TRANSPORTS.md). FS_ID keys the shared secret per app (the page derives the
 // same key from the same token + its gcuWebMCP.name). ALLOW is the capability gate.
 const TRANSPORT = (argVal('--transport', '') || 'socket').toLowerCase();
-const FOLDER = argVal('--folder', '') || process.env.GCU_WEBMCP_FOLDER || '';
 const FS_ID = argVal('--fs-id', '') || APP_NAME;
+// Exchange folder. Convention (the standard, like the per-app port): ~/webmcp/<app>,
+// the default when --folder is omitted in fs mode. ~ is expanded; the dir is created
+// on start if missing.
+const FOLDER = expandHome(argVal('--folder', '') || process.env.GCU_WEBMCP_FOLDER
+  || (TRANSPORT === 'fs' ? '~/webmcp/' + (FS_ID || 'surface') : ''));
 const FS_POLL_MS = parseInt(argVal('--poll', ''), 10) || 200;
 const ALLOW = (argVal('--allow', '') || '*').split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -620,6 +634,7 @@ function onFsMessage(msg) {
 function startFsBridge() {
   if (!FOLDER) { stderr('fs transport requires --folder PATH'); process.exit(1); }
   if (!FS_ID) { stderr('fs transport requires --app NAME (or --fs-id) — it keys the shared secret'); process.exit(1); }
+  try { fs.mkdirSync(FOLDER, { recursive: true }); } catch (e) { stderr(`could not create exchange folder ${FOLDER}: ${e.message}`); }
   const dir = makeFsDir(FOLDER);
   const hmac = (s) => crypto.createHmac('sha256', fsKey).update(s).digest('hex');
   fsChannel = new FsChannel({

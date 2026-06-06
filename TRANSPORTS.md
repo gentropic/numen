@@ -309,8 +309,15 @@ JSON-RPC; only its surface-facing side swaps the socket for the folder:
 ```json
 { "mcpServers": { "webmcp-weir": { "command": "node",
   "args": ["webmcp-bridge.js", "--app", "weir",
-           "--transport", "fs", "--folder", "~/laney-sync/weir-rpc"] } } }
+           "--transport", "fs", "--folder", "~/webmcp/weir"] } } }
 ```
+
+**Folder convention (the standard, like the per-app port).** The default exchange
+folder is **`~/webmcp/<app>`** — used when `--folder` is omitted in fs mode. A leading
+`~` is expanded by the bridge (node/`.mcp.json` args aren't shell-interpreted), so
+`--folder ~/webmcp/weir` is **portable and committable** — no username in the path. The
+bridge **creates the folder on start** if missing, so the page's folder-picker finds it
+existing. Override with an explicit `--folder` (e.g. a Syncthing'd path) for cross-machine.
 
 Because **the page advertises its own tools** (WebMCP), the bridge is fully
 surface-agnostic — it relays frames and merges the tool list the page sends. So:
