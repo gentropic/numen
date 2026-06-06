@@ -18,6 +18,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { FsChannel } = require('./fs-channel.js');
 
 // ── Configuration ──
 
@@ -38,6 +39,15 @@ function argVal(flag, fallback) {
 
 const APP_NAME = argVal('--app', '') || process.env.GCU_WEBMCP_APP || '';
 const PREFERRED_PORT = parseInt(argVal('--port', process.env.GCU_WEBMCP_PORT || '0'), 10) || 0;
+
+// Transport: 'socket' (ws/http on a localhost port, the default) or 'fs' (a shared
+// folder, TRANSPORTS.md). FS_ID keys the shared secret per app (the page derives the
+// same key from the same token + its gcuWebMCP.name). ALLOW is the capability gate.
+const TRANSPORT = (argVal('--transport', '') || 'socket').toLowerCase();
+const FOLDER = argVal('--folder', '') || process.env.GCU_WEBMCP_FOLDER || '';
+const FS_ID = argVal('--fs-id', '') || APP_NAME;
+const FS_POLL_MS = parseInt(argVal('--poll', ''), 10) || 200;
+const ALLOW = (argVal('--allow', '') || '*').split(',').map((s) => s.trim()).filter(Boolean);
 
 // ── Machine-global token (~/.gcu/webmcp.json) ──
 
@@ -63,6 +73,22 @@ function loadOrCreateToken() {
 }
 
 const sessionToken = loadOrCreateToken();
+
+// fs transport: per-app HMAC key = HKDF(machine token, salt='webmcp-fs|<FS_ID>').
+// Salting by FS_ID means the same machine token yields a distinct key per app, and
+// the page derives the identical key from the same token + its app id. The key
+// never travels — only the machine token does (provisioned out-of-band, §4.1).
+const fsKey = TRANSPORT === 'fs'
+  ? Buffer.from(crypto.hkdfSync('sha256', Buffer.from(sessionToken, 'utf8'), Buffer.alloc(0), Buffer.from('webmcp-fs|' + FS_ID, 'utf8'), 32))
+  : null;
+
+// Capability gate (SPEC: TRANSPORTS §4) — a launch-time allow-list of tool-name
+// globs; built-ins always allowed. Applies to every transport.
+const allowRes = ALLOW.map((g) => new RegExp('^' + g.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$'));
+function toolAllowed(name) {
+  if (name === 'listClients' || name === 'getConnectionInfo') return true;
+  return allowRes.some((re) => re.test(name));
+}
 
 // ── State ──
 
@@ -470,6 +496,7 @@ function getMcpTools() {
   ];
   const multi = clients.size > 1;
   for (const [name, info] of canonicalTools) {
+    if (!toolAllowed(name)) continue;   // hidden by the --allow capability gate
     const schema = { ...info.schema };
     const props = {};
     // Only inject the `client` param when more than one surface is connected —
@@ -502,9 +529,14 @@ function routeToolCall(name, input) {
     }
 
     if (name === 'getConnectionInfo') {
+      if (TRANSPORT === 'fs') {
+        return resolve({ transport: 'fs', folder: FOLDER, app: APP_NAME || undefined, id: FS_ID || undefined, instructions: 'Mount this folder in the surface (an FSA handle) and connect it with the machine token; the page derives the shared key from token + app id.' });
+      }
       const port = server.address().port;
       return resolve({ connectionString: `${port}:${sessionToken}`, port, app: APP_NAME || undefined, instructions: 'Paste into the surface\'s MCP panel, or append #mcp=<connectionString> to its URL.' });
     }
+
+    if (!toolAllowed(name)) return reject(`Tool '${name}' is not in this bridge's --allow list.`);
 
     // Resolve which connected surface handles this call. With one client, default
     // to it; with several, require the `client` param to disambiguate.
@@ -531,6 +563,73 @@ function routeToolCall(name, input) {
     pendingCalls.set(callId, { resolve, reject, timer });
     sendToClient(client, { type: 'tool_invoke', callId, name, input: rest });
   });
+}
+
+// ── fs transport (TRANSPORTS.md §3): a bridge-role FsChannel over a shared folder ──
+
+let fsChannel = null, fsClientId = null;
+
+function makeFsDir(rootDir) {
+  const fsp = fs.promises;
+  const P = (name) => path.join(rootDir, name);
+  return {
+    async read(name) { try { return await fsp.readFile(P(name), 'utf8'); } catch { return null; } },
+    // atomic on a single fs: temp + rename (a reader never sees a partial local write)
+    async write(name, str) { const f = P(name); await fsp.writeFile(f + '.tmp', str); await fsp.rename(f + '.tmp', f); },
+    async list(d) { try { return await fsp.readdir(P(d)); } catch { return []; } },
+    async remove(name) { try { await fsp.rm(P(name)); } catch { /* missing */ } },
+    async mkdirp(d) { await fsp.mkdir(P(d), { recursive: true }); },
+    async rmrf(d) { try { await fsp.rm(P(d), { recursive: true, force: true }); } catch { /* missing */ } },
+  };
+}
+
+// Map verified inbound frames onto the existing client model (same `client` shape +
+// handleClientMessage the WS/HTTP paths use). A frame that reaches here is already
+// authenticated — the channel rejects any bad-HMAC frame before delivery.
+function onFsMessage(msg) {
+  if (msg.type === 'hello') {
+    const clientId = resolveClientId(msg.name, msg.path || '');
+    if (clients.has(clientId)) cleanupClient(clientId);
+    const client = {
+      id: clientId, transport: 'fs', ws: null,
+      send: (obj) => { if (fsChannel) fsChannel.send(obj); },
+      title: msg.title || 'Untitled', path: msg.path || '', tools: [], state: 'authenticated', staleTimer: null,
+    };
+    clients.set(clientId, client);
+    fsClientId = clientId;
+    sendToClient(client, { type: 'welcome', protocol: PROTOCOL_VERSION, id: clientId });
+    stderr(`client ${clientId} connected (fs): ${client.title}`);
+    client.staleTimer = setTimeout(() => {
+      if (client.state === 'authenticated') { stderr(`client ${clientId} stale (no tools_changed)`); cleanupClient(clientId); }
+    }, STALE_TIMEOUT);
+  } else if (fsClientId && clients.has(fsClientId)) {
+    handleClientMessage(fsClientId, msg);
+  }
+}
+
+function startFsBridge() {
+  if (!FOLDER) { stderr('fs transport requires --folder PATH'); process.exit(1); }
+  if (!FS_ID) { stderr('fs transport requires --app NAME (or --fs-id) — it keys the shared secret'); process.exit(1); }
+  const dir = makeFsDir(FOLDER);
+  const hmac = (s) => crypto.createHmac('sha256', fsKey).update(s).digest('hex');
+  fsChannel = new FsChannel({
+    role: 'bridge', dir, hmac, now: Date.now,
+    randomId: () => crypto.randomBytes(8).toString('hex'),
+    onMessage: onFsMessage,
+    onState: (s) => stderr(`fs channel ${s}`),
+    log: (m) => { if (process.env.GCU_WEBMCP_DEBUG) stderr('fs: ' + m); },
+  });
+  fsChannel.start().then(() => {
+    stderr(`fs bridge on ${FOLDER} (app=${APP_NAME || '?'}, id=${FS_ID})`);
+    stderr(`connect the surface to this folder with the machine token (id=${FS_ID})`);
+    // Poll loop with a busy-guard so ticks never overlap (TRANSPORTS §3.4).
+    let busy = false;
+    setInterval(async () => {
+      if (busy) return;
+      busy = true;
+      try { await fsChannel.tick(); } catch (e) { stderr(`fs tick error: ${e.message}`); } finally { busy = false; }
+    }, FS_POLL_MS);
+  }).catch((e) => { stderr(`fs start failed: ${e.message}`); process.exit(1); });
 }
 
 // ── MCP stdio transport (newline-delimited JSON-RPC) ──
@@ -596,8 +695,23 @@ function printInfo() {
   const { file } = configPath();
   process.stdout.write(`@gcu/webmcp\n`);
   process.stdout.write(`  app:   ${APP_NAME || '(none — pass --app NAME)'}\n`);
-  process.stdout.write(`  port:  ${PREFERRED_PORT || '(OS-assigned — pass --port N for a stable app port)'}\n`);
   process.stdout.write(`  token: ${sessionToken}  (from ${file})\n`);
+  if (TRANSPORT === 'fs') {
+    process.stdout.write(`  transport: fs\n`);
+    process.stdout.write(`  folder: ${FOLDER || '(none — pass --folder PATH)'}\n`);
+    process.stdout.write(`  fs id:  ${FS_ID || '(pass --app or --fs-id)'}  (keys the shared secret; must match the page)\n`);
+    process.stdout.write(`\n.mcp.json snippet:\n`);
+    process.stdout.write(JSON.stringify({
+      mcpServers: {
+        [`webmcp${APP_NAME ? '-' + APP_NAME : ''}`]: {
+          command: 'node',
+          args: ['webmcp-bridge.js', '--app', APP_NAME || 'APP', '--transport', 'fs', '--folder', FOLDER || '/path/to/exchange'],
+        },
+      },
+    }, null, 2) + '\n');
+    return;
+  }
+  process.stdout.write(`  port:  ${PREFERRED_PORT || '(OS-assigned — pass --port N for a stable app port)'}\n`);
   if (PREFERRED_PORT) process.stdout.write(`  connect a page with: ${PREFERRED_PORT}:${sessionToken}\n`);
   process.stdout.write(`\n.mcp.json snippet:\n`);
   process.stdout.write(JSON.stringify({
@@ -619,8 +733,7 @@ if (process.argv.includes('--info') || process.argv.includes('--setup')) {
 
 function stderr(msg) { process.stderr.write(`[webmcp${APP_NAME ? ':' + APP_NAME : ''}] ${msg}\n`); }
 
-const server = http.createServer(handleHttpRequest);
-server.on('upgrade', handleUpgrade);
+let server = null;
 
 function listen(port, isFallback) {
   server.once('error', (e) => {
@@ -643,7 +756,13 @@ function listen(port, isFallback) {
   });
 }
 
-listen(PREFERRED_PORT, false);
+if (TRANSPORT === 'fs') {
+  startFsBridge();
+} else {
+  server = http.createServer(handleHttpRequest);
+  server.on('upgrade', handleUpgrade);
+  listen(PREFERRED_PORT, false);
+}
 
 // Sweep stale HTTP clients (no poll within HTTP_STALE_TIMEOUT).
 setInterval(() => {
