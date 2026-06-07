@@ -12,7 +12,7 @@ import fs from 'node:fs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bridgePath = path.join(here, '..', 'gcumcp-bridge.js');
 
-// Isolated HOME so we don't touch the real ~/.gcu/webmcp.json.
+// Isolated HOME so we don't touch the real ~/.gcu/gcumcp.json.
 const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gcumcp-'));
 const env = { ...process.env, HOME: tmpHome, USERPROFILE: tmpHome };
 
@@ -149,7 +149,7 @@ try {
   assert.ok(bad.result.isError, 'callTool to an unknown surface tool errors (not a silent pass)');
 
   // ── 7. Token file was created in the isolated HOME ──
-  const tokFile = path.join(tmpHome, '.gcu', 'webmcp.json');
+  const tokFile = path.join(tmpHome, '.gcu', 'gcumcp.json');
   assert.ok(fs.existsSync(tokFile), 'machine token persisted');
   assert.equal(JSON.parse(fs.readFileSync(tokFile, 'utf8')).token, token, 'persisted token matches advertised');
 

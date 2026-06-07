@@ -9,7 +9,7 @@
 //
 //   gcumcp-bridge.js --app weir --port 7801
 //
-// The token is read from / created in ~/.gcu/webmcp.json so it survives restarts
+// The token is read from / created in ~/.gcu/gcumcp.json so it survives restarts
 // and every bridge on the machine shares it. The port is NOT a secret; the token
 // is. (Ports are app identity; the token gates who may attach to localhost.)
 
@@ -39,7 +39,7 @@ function argVal(flag, fallback) {
 
 // Expand a leading ~ to the home dir (node does NOT do shell tilde expansion, and
 // .mcp.json args aren't shell-interpreted) — so a portable, committable, username-free
-// `--folder ~/webmcp/weir` works on every machine.
+// `--folder ~/gcumcp/weir` works on every machine.
 function expandHome(p) {
   if (!p) return p;
   if (p === '~') return os.homedir();
@@ -55,32 +55,41 @@ const PREFERRED_PORT = parseInt(argVal('--port', process.env.GCUMCP_PORT || '0')
 // same key from the same token + its gcuWebMCP.name). ALLOW is the capability gate.
 const TRANSPORT = (argVal('--transport', '') || 'socket').toLowerCase();
 const FS_ID = argVal('--fs-id', '') || APP_NAME;
-// Exchange folder. Convention (the standard, like the per-app port): ~/webmcp/<app>,
+// Exchange folder. Convention (the standard, like the per-app port): ~/gcumcp/<app>,
 // the default when --folder is omitted in fs mode. ~ is expanded; the dir is created
 // on start if missing.
 const FOLDER = expandHome(argVal('--folder', '') || process.env.GCUMCP_FOLDER
-  || (TRANSPORT === 'fs' && (APP_NAME || argVal('--fs-id', '')) ? '~/webmcp/' + (FS_ID || 'surface') : ''));
+  || (TRANSPORT === 'fs' && (APP_NAME || argVal('--fs-id', '')) ? '~/gcumcp/' + (FS_ID || 'surface') : ''));
 // Multi-surface watch mode: serve EVERY surface folder under this parent (one bridge,
 // many apps — the right model for Claude Desktop). The folder basename is the app id
-// (→ its per-app key). Defaults to ~/webmcp when fs mode is requested with no --app/--folder.
+// (→ its per-app key). Defaults to ~/gcumcp when fs mode is requested with no --app/--folder.
 const WATCH = expandHome(argVal('--watch', '') || process.env.GCUMCP_WATCH
-  || (TRANSPORT === 'fs' && !FOLDER ? '~/webmcp' : ''));
+  || (TRANSPORT === 'fs' && !FOLDER ? '~/gcumcp' : ''));
 const FS_POLL_MS = parseInt(argVal('--poll', ''), 10) || 200;
 const ALLOW = (argVal('--allow', '') || '*').split(',').map((s) => s.trim()).filter(Boolean);
 
-// ── Machine-global token (~/.gcu/webmcp.json) ──
+// ── Machine-global token (~/.gcu/gcumcp.json) ──
 
 function configPath() {
   const dir = path.join(os.homedir(), '.gcu');
-  return { dir, file: path.join(dir, 'webmcp.json') };
+  // `legacy` is the pre-rename (webmcp→gcumcp) token file; read it once + migrate forward
+  // so existing tokens (and their already-connected pages) keep working.
+  return { dir, file: path.join(dir, 'gcumcp.json'), legacy: path.join(dir, 'webmcp.json') };
 }
 
 function loadOrCreateToken() {
-  const { dir, file } = configPath();
-  try {
-    const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (cfg && typeof cfg.token === 'string' && cfg.token.length >= 16) return cfg.token;
-  } catch { /* missing / unreadable → create below */ }
+  const { dir, file, legacy } = configPath();
+  for (const f of [file, legacy]) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+      if (cfg && typeof cfg.token === 'string' && cfg.token.length >= 16) {
+        if (f === legacy) {   // migrate the old ~/.gcu/gcumcp.json token into the new file
+          try { fs.writeFileSync(file, JSON.stringify({ token: cfg.token, created: cfg.created || new Date().toISOString(), migrated_from: 'webmcp.json' }, null, 2) + '\n'); fs.chmodSync(file, 0o600); } catch { /* best effort */ }
+        }
+        return cfg.token;
+      }
+    } catch { /* missing / unreadable → try next, then create */ }
+  }
   const token = crypto.randomBytes(16).toString('hex');
   try {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -94,7 +103,7 @@ function loadOrCreateToken() {
 // The machine token. A `--token` / GCUMCP_TOKEN override lets a packaged installer
 // (e.g. a Claude Desktop .mcpb) inject a user-set token — kept in the OS keychain by the
 // host and surfaced to the user to paste into the surface — instead of the auto-created
-// ~/.gcu/webmcp.json one (which a no-shell Desktop user can't read back).
+// ~/.gcu/gcumcp.json one (which a no-shell Desktop user can't read back).
 const sessionToken = argVal('--token', '') || process.env.GCUMCP_TOKEN || loadOrCreateToken();
 
 // fs transport: per-app HMAC key = HKDF-SHA256 of the machine token with an EMPTY salt
@@ -803,9 +812,9 @@ function printInfo() {
   process.stdout.write(`  token: ${sessionToken}  (from ${tokenFrom})\n`);
   if (TRANSPORT === 'fs' && WATCH) {
     process.stdout.write(`  transport: fs (watch — multi-surface)\n`);
-    process.stdout.write(`  watch:  ${WATCH}  (serves every ~/webmcp/<app> folder; one bridge, many surfaces)\n`);
+    process.stdout.write(`  watch:  ${WATCH}  (serves every ~/gcumcp/<app> folder; one bridge, many surfaces)\n`);
     process.stdout.write(`\n.mcp.json snippet:\n`);
-    process.stdout.write(JSON.stringify({ mcpServers: { gcumcp: { command: 'node', args: ['gcumcp-bridge.js', '--transport', 'fs', '--watch', '~/webmcp'] } } }, null, 2) + '\n');
+    process.stdout.write(JSON.stringify({ mcpServers: { gcumcp: { command: 'node', args: ['gcumcp-bridge.js', '--transport', 'fs', '--watch', '~/gcumcp'] } } }, null, 2) + '\n');
     return;
   }
   if (TRANSPORT === 'fs') {

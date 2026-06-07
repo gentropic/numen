@@ -363,7 +363,8 @@
     set folder(h) { _folder = h || null; },   // inject a FileSystemDirectoryHandle ⇒ fs transport
   };
   if (typeof window !== 'undefined') {
-    window.gcuWebMCP = api;
+    window.gcuMCP = api;
+    window.gcuWebMCP = api;   // back-compat alias (the pre-rename global; weir still uses this)
     // Back-compat alias for pages migrating from the Auditable-bundled shim.
     if (!window.__auditable_mcp) window.__auditable_mcp = api;
   }

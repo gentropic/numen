@@ -38,7 +38,7 @@ function cleanup() { try { proc.kill(); } catch {} for (const d of [tmpHome, wat
 
 await Promise.race([ready, sleep(6000).then(() => { throw new Error('bridge did not announce 2 surfaces'); })]).catch(fail);
 
-const token = JSON.parse(fs.readFileSync(path.join(tmpHome, '.gcu', 'webmcp.json'), 'utf8')).token;
+const token = JSON.parse(fs.readFileSync(path.join(tmpHome, '.gcu', 'gcumcp.json'), 'utf8')).token;
 const keyFor = (app) => Buffer.from(hkdfSync('sha256', Buffer.from(token, 'utf8'), Buffer.alloc(0), Buffer.from('webmcp-fs|' + app, 'utf8'), 32));
 function makeDir(root) {
   const P = (n) => path.join(root, n);
