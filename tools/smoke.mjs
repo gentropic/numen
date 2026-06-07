@@ -136,6 +136,18 @@ try {
   const payload = JSON.parse(call.result.content[0].text);
   assert.equal(payload.echoed, 'hello bridge'); assert.equal(payload.by, 'test');
 
+  // ── 6b. Static dispatch pair (for hosts that don't honor tools/list_changed) ──
+  const staticNames = list.result.tools.map((t) => t.name);
+  assert.ok(staticNames.includes('listTools') && staticNames.includes('callTool'), 'listTools/callTool are static built-ins');
+  const lt = JSON.parse((await mcp('tools/call', { name: 'listTools', arguments: {} })).result.content[0].text);
+  assert.ok(lt.tools.find((t) => t.name === 'echo'), 'listTools surfaces the surface\'s tools');
+  assert.deepEqual(lt.tools.find((t) => t.name === 'echo').inputSchema.required, ['text'], 'listTools carries the tool schema');
+  const ct = await mcp('tools/call', { name: 'callTool', arguments: { name: 'echo', arguments: { text: 'via dispatch' } } });
+  assert.ok(!ct.result.isError, 'callTool succeeded');
+  assert.equal(JSON.parse(ct.result.content[0].text).echoed, 'via dispatch', 'callTool routed to the surface tool');
+  const bad = await mcp('tools/call', { name: 'callTool', arguments: { name: 'nope' } });
+  assert.ok(bad.result.isError, 'callTool to an unknown surface tool errors (not a silent pass)');
+
   // ── 7. Token file was created in the isolated HOME ──
   const tokFile = path.join(tmpHome, '.gcu', 'webmcp.json');
   assert.ok(fs.existsSync(tokFile), 'machine token persisted');

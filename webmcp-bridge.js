@@ -111,8 +111,9 @@ function deriveFsKey(appId) {
 // globs; built-ins always allowed. Applies to every transport. `*`→`.*`, anchored;
 // all other regex metachars (incl. `?`) are escaped so a glob can't over-match.
 const allowRes = ALLOW.map((g) => new RegExp('^' + g.replace(/[.+^${}()|[\]\\?]/g, '\\$&').replace(/\*/g, '.*') + '$'));
+const BUILTIN_TOOLS = new Set(['listClients', 'getConnectionInfo', 'listTools', 'callTool']);
 function toolAllowed(name) {
-  if (name === 'listClients' || name === 'getConnectionInfo') return true;
+  if (BUILTIN_TOOLS.has(name)) return true;
   return allowRes.some((re) => re.test(name));
 }
 
@@ -519,6 +520,18 @@ function getMcpTools() {
       inputSchema: { type: 'object', properties: {} },
       annotations: { readOnlyHint: true, idempotentHint: true, title: 'Get bridge connection string' },
     },
+    {
+      name: 'listTools',
+      description: 'List the tools a connected surface advertises (names, descriptions, input schemas) — the dynamic, surface-contributed tools (e.g. weir_queryItems). Pair with callTool. Use these two when a surface\'s native tools are NOT visible on this host — which happens when the host indexes a server\'s tools at connect-time and does not re-pull after a surface registers tools later (it ignores notifications/tools/list_changed). listTools + callTool are STATIC bridge built-ins, so they\'re always discoverable. Pass `client` only when more than one surface is connected.',
+      inputSchema: { type: 'object', properties: { client: { type: 'string', description: 'Client ID (use listClients) — only needed with >1 surface' } } },
+      annotations: { readOnlyHint: true, idempotentHint: true, title: 'List a surface\'s tools' },
+    },
+    {
+      name: 'callTool',
+      description: 'Invoke a surface tool by name — a static dispatcher to the dynamic surface tools (discover them with listTools). Use when the native surface tools aren\'t visible on this host. `name` = the surface tool (e.g. "weir_queryItems"); `arguments` = its input object (matching that tool\'s schema from listTools). `client` only with >1 surface. Honors the bridge --allow gate. Static bridge built-in.',
+      inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'The surface tool to invoke (from listTools)' }, arguments: { type: 'object', description: 'The tool\'s input arguments (its schema from listTools)' }, client: { type: 'string', description: 'Client ID (use listClients) — only needed with >1 surface' } }, required: ['name'] },
+      annotations: { title: 'Call a surface tool' },
+    },
   ];
   const multi = clients.size > 1;
   for (const [name, info] of canonicalTools) {
@@ -563,6 +576,32 @@ function routeToolCall(name, input) {
       }
       const port = server.address().port;
       return resolve({ connectionString: `${port}:${sessionToken}`, port, app: APP_NAME || undefined, instructions: 'Paste into the surface\'s MCP panel, or append #mcp=<connectionString> to its URL.' });
+    }
+
+    // listTools — the static counterpart to the dynamic surface tools (for hosts that
+    // don't re-pull on tools/list_changed). Returns the resolved surface's allowed tools.
+    if (name === 'listTools') {
+      let clientId = input.client;
+      if (!clientId) {
+        const ready = [...clients.values()].filter((c) => c.state === 'ready');
+        if (ready.length === 1) clientId = ready[0].id;
+        else if (ready.length === 0) return reject('No surface is connected yet. Use listClients.');
+        else return reject(`Multiple surfaces connected: ${ready.map((c) => c.id).join(', ')}. Pass the 'client' parameter.`);
+      }
+      const client = clients.get(clientId);
+      if (!client || client.state !== 'ready') return reject(`Client '${clientId}' is not ready. Use listClients.`);
+      const list = client.tools.filter((t) => toolAllowed(t.name)).map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
+      return resolve({ client: clientId, count: list.length, tools: list });
+    }
+
+    // callTool — a static dispatcher to a surface tool by name. Remap to the target,
+    // then fall through to normal routing (which re-checks --allow on the TARGET, so
+    // callTool can't bypass the capability gate).
+    if (name === 'callTool') {
+      const target = String(input.name || '');
+      if (!target) return reject('callTool requires `name` (the surface tool to invoke). List options with listTools.');
+      name = target;
+      input = { ...(input.arguments || {}), ...(input.client ? { client: input.client } : {}) };
     }
 
     if (!toolAllowed(name)) return reject(`Tool '${name}' is not in this bridge's --allow list.`);
