@@ -415,6 +415,28 @@ A **`--token` / `GCU_WEBMCP_TOKEN` override** lets the `.mcpb` inject a *user-se
 (host-kept in the OS keychain, surfaced for the user to paste into each page) instead of
 the auto-created `~/.gcu/webmcp.json` one — which a no-shell Desktop user can't read back.
 
+### 6.4 Static dispatch pair — cross-host tool discovery
+
+A surface's tools are **dynamic**: the bridge only learns them when the surface connects
+(possibly long after the MCP client did) and publishes them via `tools/list` +
+`notifications/tools/list_changed`. **Claude Code honors `list_changed`** and re-pulls, so
+`weir_*` appear live. But some hosts (observed: **Claude Desktop / claude.ai**) index a
+server's tools at connect-time through a tool-search index and **don't re-ingest
+`list_changed` additions** — so dynamically-registered surface tools never become
+discoverable there (the tell: the bridge's *static* `listClients`/`getConnectionInfo` work,
+but no `weir_*` ever shows). It's a host discovery limitation, not a bridge bug.
+
+The portable fix is two **static** bridge built-ins — always in any host's index:
+- **`listTools(client?)`** → the connected surface's tools (names, descriptions, schemas).
+- **`callTool(name, arguments, client?)`** → invoke one. It **remaps to the target then
+  re-checks `--allow`** on that target, so it can't bypass the capability gate.
+
+The native dynamic tools stay — so `list_changed`-honoring hosts (Claude Code) keep
+ergonomic typed `weir_*` tools, while index-only hosts fall back to `listTools` +
+`callTool`. This is a **transport-level relay fallback on the bridge**, *not* an app
+tool-design dispatcher (a surface's own tools should still be distinct verbs, not one
+`{action}` tool). Proven by `tools/smoke.mjs`.
+
 ---
 
 ## 7. WebRTC upgrade — v1.5 seam (spec now, build next)
