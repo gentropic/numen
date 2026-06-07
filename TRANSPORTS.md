@@ -509,13 +509,18 @@ is additive.
 - **v1.5 — WebRTC upgrade** (§7), folder-signalled, opportunistic, STUN-only.
 - **v2 — hardening:** payload encryption option, multi-peer per folder, TURN, a
   shared consent helper (SPEC §10).
-- **Distribution / reach (deferred):**
-  - **Claude Desktop bundle.** Desktop has no fs/exec — it needs the bridge as an MCP
-    *server*, and a bare machine may have no node. Package the bridge as a
-    **runtime-bundled Desktop Extension** (`.dxt` / the newer `.mcpb` MCP-bundle):
-    one-click install, node bundled, no config editing, no loose-binary code-signing.
-    The right Desktop answer (better than `deno compile` signed binaries). *Verify the
-    current bundle format/manifest before building — Anthropic renamed it once.*
+- **Distribution / reach:**
+  - **Claude Desktop bundle — ✅ built.** `manifest.json` (MCPB v0.3) + `npm run mcpb`
+    (`tools/build-mcpb.mjs`) → `dist/gcu-webmcp.mcpb` (~20 kB, validated). A node server
+    running the bridge in **multi-surface watch mode** (`--watch ${user_config.folder}`,
+    default `~/webmcp`); `user_config` collects the folder + a sensitive token (→ OS
+    keychain → `GCU_WEBMCP_TOKEN`). Claude Desktop's **bundled Node** runs it — no node
+    install, no config editing, no loose-binary code-signing. One bundle, all surfaces.
+    *Remaining: live install verification (interactive, on Desktop); ship via GitHub
+    Releases.* (Desktop's MCPB renamed from `.dxt` late 2025 — both still install.)
+  - **Non-JS reference driver** *(deferred, §6.2).* A ~40-line Python/shell `query`/
+    `relate` that signs + exchanges folder frames — makes "any fs tool can drive a
+    surface" concrete, and documents the open protocol by example.
   - **Non-JS reference driver** (§6.2). A ~40-line Python/shell `query`/`relate` that
     signs + exchanges folder frames — makes "any fs tool can drive a surface" concrete,
     and documents the open protocol by example.

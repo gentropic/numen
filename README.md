@@ -54,8 +54,15 @@ it. Use the **`fs` transport** — no port, no extension — run straight from G
 ```
 claude mcp add weir --scope user -- npx -y github:gentropic/webmcp --app weir --transport fs
 ```
-**Claude Desktop:** add to `claude_desktop_config.json` (`%APPDATA%\Claude\` on
-Windows, `~/Library/Application Support/Claude/` on macOS):
+**Claude Desktop — one-click bundle (recommended):** `npm run mcpb` →
+`dist/gcu-webmcp.mcpb`; double-click it (or Settings → Extensions → Install). It
+installs **one multi-surface bridge** (`--watch ~/webmcp`) that serves **every** GCU
+surface — no per-app config, and **Claude Desktop's bundled Node runs it (nothing else
+to install)**. At install it asks for a folder (default `~/webmcp`) + a token you choose;
+paste that same token into each surface's WebMCP settings when you connect its folder.
+
+**Claude Desktop — manual config** (alternative): add to `claude_desktop_config.json`
+(`%APPDATA%\Claude\` on Windows, `~/Library/Application Support/Claude/` on macOS):
 ```json
 { "mcpServers": { "weir": { "command": "npx",
   "args": ["-y", "github:gentropic/webmcp", "--app", "weir", "--transport", "fs"] } } }
