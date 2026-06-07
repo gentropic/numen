@@ -59,7 +59,12 @@ const FS_ID = argVal('--fs-id', '') || APP_NAME;
 // the default when --folder is omitted in fs mode. ~ is expanded; the dir is created
 // on start if missing.
 const FOLDER = expandHome(argVal('--folder', '') || process.env.GCU_WEBMCP_FOLDER
-  || (TRANSPORT === 'fs' ? '~/webmcp/' + (FS_ID || 'surface') : ''));
+  || (TRANSPORT === 'fs' && (APP_NAME || argVal('--fs-id', '')) ? '~/webmcp/' + (FS_ID || 'surface') : ''));
+// Multi-surface watch mode: serve EVERY surface folder under this parent (one bridge,
+// many apps — the right model for Claude Desktop). The folder basename is the app id
+// (→ its per-app key). Defaults to ~/webmcp when fs mode is requested with no --app/--folder.
+const WATCH = expandHome(argVal('--watch', '') || process.env.GCU_WEBMCP_WATCH
+  || (TRANSPORT === 'fs' && !FOLDER ? '~/webmcp' : ''));
 const FS_POLL_MS = parseInt(argVal('--poll', ''), 10) || 200;
 const ALLOW = (argVal('--allow', '') || '*').split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -86,16 +91,21 @@ function loadOrCreateToken() {
   return token;
 }
 
-const sessionToken = loadOrCreateToken();
+// The machine token. A `--token` / GCU_WEBMCP_TOKEN override lets a packaged installer
+// (e.g. a Claude Desktop .mcpb) inject a user-set token — kept in the OS keychain by the
+// host and surfaced to the user to paste into the surface — instead of the auto-created
+// ~/.gcu/webmcp.json one (which a no-shell Desktop user can't read back).
+const sessionToken = argVal('--token', '') || process.env.GCU_WEBMCP_TOKEN || loadOrCreateToken();
 
-// fs transport: per-app HMAC key = HKDF-SHA256 of the machine token with an EMPTY
-// salt and info='webmcp-fs|<FS_ID>' (32 bytes). The info (not the salt) carries the
-// app id, so the same machine token yields a distinct key per app and the page
-// derives the identical key from the same token + its app id via crypto.subtle. The
-// key never travels — only the machine token does (provisioned out-of-band, §4.1).
-const fsKey = TRANSPORT === 'fs'
-  ? Buffer.from(crypto.hkdfSync('sha256', Buffer.from(sessionToken, 'utf8'), Buffer.alloc(0), Buffer.from('webmcp-fs|' + FS_ID, 'utf8'), 32))
-  : null;
+// fs transport: per-app HMAC key = HKDF-SHA256 of the machine token with an EMPTY salt
+// and info='webmcp-fs|<appId>' (32 bytes). The info (not the salt) carries the app id,
+// so the same machine token yields a distinct key per app and the page derives the
+// identical key from the same token + its app id via crypto.subtle. The key never
+// travels — only the machine token does (provisioned out-of-band, §4.1). Per-app so one
+// (watch-mode) bridge can serve many surfaces, each with its own key.
+function deriveFsKey(appId) {
+  return Buffer.from(crypto.hkdfSync('sha256', Buffer.from(sessionToken, 'utf8'), Buffer.alloc(0), Buffer.from('webmcp-fs|' + appId, 'utf8'), 32));
+}
 
 // Capability gate (SPEC: TRANSPORTS §4) — a launch-time allow-list of tool-name
 // globs; built-ins always allowed. Applies to every transport. `*`→`.*`, anchored;
@@ -545,6 +555,9 @@ function routeToolCall(name, input) {
     }
 
     if (name === 'getConnectionInfo') {
+      if (TRANSPORT === 'fs' && WATCH) {
+        return resolve({ transport: 'fs', mode: 'watch', watch: WATCH, surfaces: [...fsSurfaces.keys()], instructions: `Serving every surface folder under ${WATCH}. In a surface (e.g. weir) pick its folder ${WATCH}/<app> and connect with the machine token; new folders are picked up automatically.` });
+      }
       if (TRANSPORT === 'fs') {
         return resolve({ transport: 'fs', folder: FOLDER, app: APP_NAME || undefined, id: FS_ID || undefined, instructions: 'Mount this folder in the surface (an FSA handle) and connect it with the machine token; the page derives the shared key from token + app id.' });
       }
@@ -583,7 +596,8 @@ function routeToolCall(name, input) {
 
 // ── fs transport (TRANSPORTS.md §3): a bridge-role FsChannel over a shared folder ──
 
-let fsChannel = null, fsClientId = null;
+const fsSurfaces = new Map();   // appId → { appId, folder, channel, clientId } — one per served surface
+const APPID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;   // a sane surface/app id (folder basename)
 
 function makeFsDir(rootDir) {
   const fsp = fs.promises;
@@ -607,55 +621,80 @@ function makeFsDir(rootDir) {
   };
 }
 
-// Map verified inbound frames onto the existing client model (same `client` shape +
-// handleClientMessage the WS/HTTP paths use). A frame that reaches here is already
-// authenticated — the channel rejects any bad-HMAC frame before delivery.
-function onFsMessage(msg) {
+// Map a surface's verified inbound frames onto the shared client model (the same
+// `client` shape + handleClientMessage the WS/HTTP paths use). A frame that reaches
+// here is already authenticated — the channel rejects any bad-HMAC frame before
+// delivery. Each surface keeps its OWN client (so weir's tools and auditable's tools
+// are distinct, disambiguated by the existing `client` param when >1 is connected).
+function onFsMessage(surface, msg) {
   if (msg.type === 'hello') {
-    const clientId = resolveClientId(msg.name, msg.path || '');
+    const clientId = resolveClientId(msg.name || surface.appId, msg.path || '');
     if (clients.has(clientId)) cleanupClient(clientId);
     const client = {
       id: clientId, transport: 'fs', ws: null,
-      send: (obj) => { if (fsChannel) fsChannel.send(obj); },
-      title: msg.title || 'Untitled', path: msg.path || '', tools: [], state: 'authenticated', staleTimer: null,
+      send: (obj) => surface.channel.send(obj),
+      title: msg.title || surface.appId, path: msg.path || '', tools: [], state: 'authenticated', staleTimer: null,
     };
     clients.set(clientId, client);
-    fsClientId = clientId;
+    surface.clientId = clientId;
     sendToClient(client, { type: 'welcome', protocol: PROTOCOL_VERSION, id: clientId });
-    stderr(`client ${clientId} connected (fs): ${client.title}`);
+    stderr(`client ${clientId} connected (fs:${surface.appId}): ${client.title}`);
     client.staleTimer = setTimeout(() => {
       if (client.state === 'authenticated') { stderr(`client ${clientId} stale (no tools_changed)`); cleanupClient(clientId); }
     }, STALE_TIMEOUT);
-  } else if (fsClientId && clients.has(fsClientId)) {
-    handleClientMessage(fsClientId, msg);
+  } else if (surface.clientId && clients.has(surface.clientId)) {
+    handleClientMessage(surface.clientId, msg);
   }
 }
 
-function startFsBridge() {
-  if (!FOLDER) { stderr('fs transport requires --folder PATH'); process.exit(1); }
-  if (!FS_ID) { stderr('fs transport requires --app NAME (or --fs-id) — it keys the shared secret'); process.exit(1); }
-  try { fs.mkdirSync(FOLDER, { recursive: true }); } catch (e) { stderr(`could not create exchange folder ${FOLDER}: ${e.message}`); }
-  const dir = makeFsDir(FOLDER);
-  const hmac = (s) => crypto.createHmac('sha256', fsKey).update(s).digest('hex');
-  fsChannel = new FsChannel({
-    role: 'bridge', dir, hmac, now: Date.now,
+// Serve one surface: a bridge-role FsChannel over its folder, keyed by its app id.
+// Idempotent (won't double-start a folder). The app id (folder basename) must match
+// the page's gcuWebMCP.name so their derived keys agree.
+function startFsSurface(appId, folder) {
+  if (fsSurfaces.has(appId)) return;
+  const key = deriveFsKey(appId);
+  const hmac = (s) => crypto.createHmac('sha256', key).update(s).digest('hex');
+  const surface = { appId, folder, channel: null, clientId: null };
+  surface.channel = new FsChannel({
+    role: 'bridge', dir: makeFsDir(folder), hmac, now: Date.now,
     randomId: () => crypto.randomBytes(8).toString('hex'),
-    onMessage: onFsMessage,
-    onState: (s) => stderr(`fs channel ${s}`),
-    onWarn: (m) => stderr(`fs: ${m}`),   // always-on: forged/stale frames, bad announce — never hidden
-    log: (m) => { if (process.env.GCU_WEBMCP_DEBUG) stderr('fs: ' + m); },
+    onMessage: (msg) => onFsMessage(surface, msg),
+    onState: (s) => stderr(`fs[${appId}] ${s}`),
+    onWarn: (m) => stderr(`fs[${appId}]: ${m}`),   // always-on: forged/stale frames, bad announce
+    log: (m) => { if (process.env.GCU_WEBMCP_DEBUG) stderr(`fs[${appId}]: ${m}`); },
   });
-  fsChannel.start().then(() => {
-    stderr(`fs bridge on ${FOLDER} (app=${APP_NAME || '?'}, id=${FS_ID})`);
-    stderr(`connect the surface to this folder with the machine token (id=${FS_ID})`);
-    // Poll loop with a busy-guard so ticks never overlap (TRANSPORTS §3.4).
-    let busy = false;
+  fsSurfaces.set(appId, surface);
+  try { fs.mkdirSync(folder, { recursive: true }); } catch (e) { stderr(`could not create ${folder}: ${e.message}`); }
+  surface.channel.start().then(() => {
+    stderr(`fs surface "${appId}" on ${folder}`);
+    let busy = false;   // busy-guard so ticks never overlap (TRANSPORTS §3.4)
     setInterval(async () => {
       if (busy) return;
       busy = true;
-      try { await fsChannel.tick(); } catch (e) { stderr(`fs tick error: ${e.message}`); } finally { busy = false; }
+      try { await surface.channel.tick(); } catch (e) { stderr(`fs[${appId}] tick: ${e.message}`); } finally { busy = false; }
     }, FS_POLL_MS);
-  }).catch((e) => { stderr(`fs start failed: ${e.message}`); process.exit(1); });
+  }).catch((e) => stderr(`fs[${appId}] start failed: ${e.message}`));
+}
+
+function startFsBridge() {
+  if (WATCH) {
+    // Multi-surface: serve every subfolder of WATCH as a surface, rescanning so newly
+    // connected apps (their folder created via the page's directory picker) light up.
+    stderr(`fs watch mode on ${WATCH} — serving every surface folder there`);
+    try { fs.mkdirSync(WATCH, { recursive: true }); } catch (e) { stderr(`could not create ${WATCH}: ${e.message}`); }
+    const scan = () => {
+      let entries = [];
+      try { entries = fs.readdirSync(WATCH, { withFileTypes: true }); } catch { /* gone */ }
+      for (const e of entries) if (e.isDirectory() && APPID_RE.test(e.name)) startFsSurface(e.name, path.join(WATCH, e.name));
+    };
+    scan();
+    setInterval(scan, 5000);
+    return;
+  }
+  // Single-surface: one folder, app id = FS_ID.
+  if (!FOLDER) { stderr('fs transport requires --folder PATH or --watch DIR'); process.exit(1); }
+  if (!FS_ID) { stderr('fs transport requires --app NAME (or --fs-id) — it keys the shared secret'); process.exit(1); }
+  startFsSurface(FS_ID, FOLDER);
 }
 
 // ── MCP stdio transport (newline-delimited JSON-RPC) ──
@@ -721,7 +760,15 @@ function printInfo() {
   const { file } = configPath();
   process.stdout.write(`@gcu/webmcp\n`);
   process.stdout.write(`  app:   ${APP_NAME || '(none — pass --app NAME)'}\n`);
-  process.stdout.write(`  token: ${sessionToken}  (from ${file})\n`);
+  const tokenFrom = (argVal('--token', '') || process.env.GCU_WEBMCP_TOKEN) ? '--token / env (not persisted)' : file;
+  process.stdout.write(`  token: ${sessionToken}  (from ${tokenFrom})\n`);
+  if (TRANSPORT === 'fs' && WATCH) {
+    process.stdout.write(`  transport: fs (watch — multi-surface)\n`);
+    process.stdout.write(`  watch:  ${WATCH}  (serves every ~/webmcp/<app> folder; one bridge, many surfaces)\n`);
+    process.stdout.write(`\n.mcp.json snippet:\n`);
+    process.stdout.write(JSON.stringify({ mcpServers: { webmcp: { command: 'node', args: ['webmcp-bridge.js', '--transport', 'fs', '--watch', '~/webmcp'] } } }, null, 2) + '\n');
+    return;
+  }
   if (TRANSPORT === 'fs') {
     process.stdout.write(`  transport: fs\n`);
     process.stdout.write(`  folder: ${FOLDER || '(none — pass --folder PATH)'}\n`);

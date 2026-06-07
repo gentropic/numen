@@ -59,7 +59,7 @@ function mcp(method, params) {
 // Wait for the fs bridge to announce ready on stderr.
 proc.stderr.setEncoding('utf8');
 const ready = new Promise((resolve) => {
-  proc.stderr.on('data', (d) => { if (/fs bridge on/.test(String(d))) resolve(); });
+  proc.stderr.on('data', (d) => { if (/fs surface .* on /.test(String(d))) resolve(); });
 });
 const fail = (e) => { console.error(e); cleanup(); process.exit(1); };
 proc.on('error', fail);

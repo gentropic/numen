@@ -391,6 +391,30 @@ So the `fs` transport is an open interface, not just an MCP thing.
   the *process*; the direct-folder / no-runtime escape hatch is Code-only. Desktop's
   no-runtime answer is a **runtime-bundled extension** (§9), not unsigned frames.
 
+### 6.3 Multi-surface watch mode — one bridge, many surfaces (the Desktop model)
+
+`--watch <dir>` (default `~/webmcp`) runs **one** bridge that serves **every** surface
+folder under `<dir>` — one `FsChannel` per subfolder, each keyed by its **basename = app
+id**, all feeding the shared client map. The existing multi-client routing (`listClients`
++ the auto-injected `client` param when >1 surface is connected, SPEC §2.3) disambiguates
+weir's tools from auditable's. The bridge rescans, so a surface lights up when its folder
+appears (the user creates `~/webmcp/<app>` via the page's own directory picker). One
+machine token covers all — each surface derives its **own** per-app key from `token + app
+id`, so the same pasted token works everywhere.
+
+**This deliberately splits topology by client role** (relaxing SPEC §2's per-app
+isolation — flagged, not silent):
+- **Claude Code** stays **per-app** (per-repo `.mcp.json`): you're *in weir's repo*, you
+  shouldn't accidentally reach auditable. Isolation is correct.
+- **Claude Desktop** is your **general assistant**, not a per-project session, so seeing
+  *all* your GCU surfaces at once is the point → **one multi-surface bridge**. This is the
+  one `.mcpb` install (§9): `--transport fs --watch ~/webmcp`, no per-app bundle needed.
+  The `--allow` capability gate still bounds what any connected surface can do.
+
+A **`--token` / `GCU_WEBMCP_TOKEN` override** lets the `.mcpb` inject a *user-set* token
+(host-kept in the OS keychain, surfaced for the user to paste into each page) instead of
+the auto-created `~/.gcu/webmcp.json` one — which a no-shell Desktop user can't read back.
+
 ---
 
 ## 7. WebRTC upgrade — v1.5 seam (spec now, build next)
