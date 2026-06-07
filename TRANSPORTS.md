@@ -188,7 +188,7 @@ socket to anchor session identity to:
 
 - **Key.** Reuse the existing machine token (`~/.gcu/webmcp.json`, SPEC §5) — no
   new secret to provision. Derive a per-app key: `key = HKDF-SHA256(ikm = token,
-  salt = "" , info = "webmcp-fs|" + appId, len = 32)`, so the same token yields a
+  salt = "" , info = "gcumcp-fs|" + appId, len = 32)`, so the same token yields a
   distinct key per app and the page derives the identical key from the same token +
   its app id (node `crypto.hkdfSync` ↔ browser `crypto.subtle` HKDF, verified to
   match). A reserved future HKDF output could become an AES key if a fully-untrusted
@@ -362,7 +362,7 @@ gcuFetch` forces HTTP today) — and `gcuWebMCP.connect("<machine-token>")` with
   dropped** (the seq commits only on success — a transient lock/AV/sync error must
   not burn a seq and wedge the channel).
 - **Key derivation** matches the bridge exactly via `crypto.subtle`: `HKDF(token,
-  salt='', info='webmcp-fs|'+gcuWebMCP.name)` → HMAC-SHA256 → hex. Needs a secure
+  salt='', info='gcumcp-fs|'+gcuWebMCP.name)` → HMAC-SHA256 → hex. Needs a secure
   context (https / localhost / file://); the page derives the same key the bridge
   did from the same token + app id.
 

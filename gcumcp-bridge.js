@@ -107,13 +107,13 @@ function loadOrCreateToken() {
 const sessionToken = argVal('--token', '') || process.env.GCUMCP_TOKEN || loadOrCreateToken();
 
 // fs transport: per-app HMAC key = HKDF-SHA256 of the machine token with an EMPTY salt
-// and info='webmcp-fs|<appId>' (32 bytes). The info (not the salt) carries the app id,
+// and info='gcumcp-fs|<appId>' (32 bytes). The info (not the salt) carries the app id,
 // so the same machine token yields a distinct key per app and the page derives the
 // identical key from the same token + its app id via crypto.subtle. The key never
 // travels — only the machine token does (provisioned out-of-band, §4.1). Per-app so one
 // (watch-mode) bridge can serve many surfaces, each with its own key.
 function deriveFsKey(appId) {
-  return Buffer.from(crypto.hkdfSync('sha256', Buffer.from(sessionToken, 'utf8'), Buffer.alloc(0), Buffer.from('webmcp-fs|' + appId, 'utf8'), 32));
+  return Buffer.from(crypto.hkdfSync('sha256', Buffer.from(sessionToken, 'utf8'), Buffer.alloc(0), Buffer.from('gcumcp-fs|' + appId, 'utf8'), 32));
 }
 
 // Capability gate (SPEC: TRANSPORTS §4) — a launch-time allow-list of tool-name

@@ -73,7 +73,7 @@ await Promise.race([ready, sleep(5000).then(() => { throw new Error('fs bridge d
 
 // ── mock page: an FsChannel peer over the same folder, with the same derived key ──
 const token = JSON.parse(fs.readFileSync(path.join(tmpHome, '.gcu', 'gcumcp.json'), 'utf8')).token;
-const fsKey = Buffer.from(hkdfSync('sha256', Buffer.from(token, 'utf8'), Buffer.alloc(0), Buffer.from('webmcp-fs|test', 'utf8'), 32));
+const fsKey = Buffer.from(hkdfSync('sha256', Buffer.from(token, 'utf8'), Buffer.alloc(0), Buffer.from('gcumcp-fs|test', 'utf8'), 32));
 const hmac = (s) => createHmac('sha256', fsKey).update(s).digest('hex');
 
 const fsp = fs.promises;

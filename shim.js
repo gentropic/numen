@@ -212,11 +212,11 @@
   }
 
   // Derive the per-app HMAC key identically to the bridge: HKDF(token, salt='',
-  // info='webmcp-fs|<app id>'), then HMAC-SHA256 over the canonical string → hex.
+  // info='gcumcp-fs|<app id>'), then HMAC-SHA256 over the canonical string → hex.
   async function _fsHmac(token, id) {
     var enc = new TextEncoder();
     var ikm = await crypto.subtle.importKey('raw', enc.encode(token), 'HKDF', false, ['deriveBits']);
-    var bits = await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: enc.encode('webmcp-fs|' + id) }, ikm, 256);
+    var bits = await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: enc.encode('gcumcp-fs|' + id) }, ikm, 256);
     var key = await crypto.subtle.importKey('raw', bits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
     return async function (str) {
       var sig = await crypto.subtle.sign('HMAC', key, enc.encode(str));
