@@ -1,6 +1,6 @@
 {
   "name": "@gcu/numen",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Zero-dependency numen (GCU Model Context Protocol) bridge: connect Claude Code / Claude Desktop (or any MCP stdio client) to GCU browser surfaces (weir, …) — over a localhost socket, or a shared folder (fs transport: no port, no extension). Runs on node, bun, or deno.",
   "license": "MIT",
   "author": "Arthur Endlein Correia",

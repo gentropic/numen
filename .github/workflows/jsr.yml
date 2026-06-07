@@ -1,0 +1,28 @@
+# Publish @gcu/numen to JSR on each published Release, from CI with OIDC — which
+# gives a public transparency-log entry (JSR "provenance" score). No JSR token
+# needed: the GitHub OIDC identity authenticates, provided the package is linked to
+# this repo in JSR settings (Package → Settings → link the gentropic/numen repo).
+# Bump the version in deno.json before cutting a release (JSR rejects a re-publish of
+# an existing version). --allow-slow-types: numen is a run-it CLI, not an imported
+# typed library, so we don't gate publishing on type annotations.
+name: jsr-publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write   # OIDC → JSR provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Publish to JSR (with provenance)
+        run: npx jsr publish --allow-slow-types

@@ -16,7 +16,7 @@ const out = path.join(dist, 'numen.mcpb');
 rmSync(stage, { recursive: true, force: true });
 mkdirSync(stage, { recursive: true });
 for (const f of ['numen-bridge.js', 'fs-channel.js', 'manifest.json', 'LICENSE']) copyFileSync(path.join(root, f), path.join(stage, f));
-writeFileSync(path.join(stage, 'package.json'), JSON.stringify({ name: 'numen', version: '0.1.1', type: 'module', private: true }, null, 2) + '\n');
+writeFileSync(path.join(stage, 'package.json'), JSON.stringify({ name: 'numen', version: '0.1.2', type: 'module', private: true }, null, 2) + '\n');
 
 execSync(`npx -y @anthropic-ai/mcpb pack "${stage}" "${out}"`, { stdio: 'inherit' });
 rmSync(stage, { recursive: true, force: true });
