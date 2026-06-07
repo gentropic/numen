@@ -336,6 +336,12 @@
         _tools.delete(name);
         if (_state === 'connected') _send({ type: 'tools_changed', tools: _serializeTools() });
       },
+      // Re-push the current tool list without a register/unregister — for apps
+      // whose tool availability changes without the set changing (e.g. Auditable
+      // re-gating tools on notebook lock/unlock).
+      notifyToolsChanged: function () {
+        if (_state === 'connected') _send({ type: 'tools_changed', tools: _serializeTools() });
+      },
     };
   }
 
