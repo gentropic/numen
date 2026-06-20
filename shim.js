@@ -1,4 +1,4 @@
-// @gcu/numen shim — WebMCP polyfill + WebSocket/HTTP bridge client.
+// @gcu/numen shim — WebMCP polyfill + WebSocket/HTTP/fs bridge client.
 // Generic: knows nothing about any specific app. Drop it into any page; it
 // installs navigator.modelContext (registerTool/unregisterTool) and a small
 // window.gcuWebMCP control surface, then relays tool calls to a @gcu/numen
@@ -19,21 +19,32 @@
 // HTTP long-poll transport through it, sidestepping the page-origin gate.
 // Injecting a fetch forces the HTTP transport (WS is skipped). On localhost/
 // file:// dev, leave it unset and WS/direct-HTTP are used.
+//
+// MULTICHANNEL fs (SPEC-numen-multichannel.md): the fs transport supports MORE
+// THAN ONE bridge at once — one FsChannel per folder, all sharing this page's tool
+// registry. Each bridge gets its own folder (folder = identity); replies route back
+// to the calling channel, and the calling channel's `identity` is carried into tool
+// execution (the SPEC-librarian §2 provenance hook). `gcuMCP.addFolder({id, handle,
+// token, identity})` adds a channel; `gcuMCP.folder = h; connect(token)` is the
+// single-channel shim (id 'default'). WS/HTTP stay single (localhost, one bridge).
 
 (function () {
   var PROTOCOL = 1;
   var FS_POLL_MS = 350;             // fs-transport poll cadence (reads are cheap; see TRANSPORTS §3.4)
 
   var _tools = new Map();
-  var _transport = null;            // { type: 'ws'|'http'|'fs', ... }
-  var _state = 'disconnected';      // disconnected | connecting | connected | error
+  var _transport = null;            // { type: 'ws'|'http', ... } — the localhost (single) transport
+  var _state = 'disconnected';      // disconnected | connecting | connected | error (aggregate)
   var _clientId = null;
   var _portAndToken = null;
   var _reconnectTimer = null;
   var _name = null;
   var _onStateChange = null;
   var _fetch = null;                // injected fetch for the HTTP transport (e.g. gcuFetch)
-  var _folder = null;               // injected FileSystemDirectoryHandle ⇒ forces the fs transport
+  var _folder = null;               // injected FileSystemDirectoryHandle ⇒ the legacy single fs channel
+  var _fsChannels = new Map();      // id → { id, handle, token, identity, channel, clientId, state, timer, polling } (multichannel fs)
+  var _identity = null;             // default identity stamped on the legacy single fs channel
+  var _onChannelState = null;       // optional per-channel state callback (id, state, identity, clientId)
 
   // HTTP-transport fetch: the injected one if set, else the global. Injecting one
   // also forces the HTTP transport (see _connect) — that's the public-origin path.
@@ -58,6 +69,13 @@
     return tools;
   }
 
+  // Push the current tool list to every live transport (the ws/http one + each fs channel).
+  function _broadcastToolsChanged() {
+    var payload = { type: 'tools_changed', tools: _serializeTools() };
+    if (_transport && _state === 'connected') _send(payload);
+    _fsChannels.forEach(function (e) { if (e.channel && e.state === 'connected') e.channel.send(payload); });
+  }
+
   function _derivedName() {
     var title = (typeof document !== 'undefined' && document.title) || 'surface';
     // Strip a leading "AppName — " / "AppName - " prefix, then slugify.
@@ -67,7 +85,7 @@
 
   function _effectiveName() { return _name || _derivedName(); }
 
-  // ── transport-agnostic send ──
+  // ── transport-agnostic send (the single ws/http transport) ──
 
   function _send(obj) {
     if (!_transport) return;
@@ -75,8 +93,6 @@
       if (_transport.ws && _transport.ws.readyState === WebSocket.OPEN) _transport.ws.send(JSON.stringify(obj));
     } else if (_transport.type === 'http') {
       _httpSend(obj);
-    } else if (_transport.type === 'fs') {
-      if (_transport.channel) _transport.channel.send(obj);
     }
   }
 
@@ -85,7 +101,6 @@
     var t = _transport;
     if (t.type === 'ws' && t.ws) { try { t.ws.close(); } catch (e) { /* ignore */ } }
     if (t.type === 'http') t.polling = false;
-    if (t.type === 'fs') { t.polling = false; if (t.timer) clearInterval(t.timer); if (t.channel) t.channel.stop(); }
     _transport = null;
   }
 
@@ -104,7 +119,7 @@
         _send({ type: 'tools_changed', tools: _serializeTools() });
         resolve();
       };
-      ws.onmessage = function (event) { var msg; try { msg = JSON.parse(event.data); } catch (e) { return; } _handleMessage(msg); };
+      ws.onmessage = function (event) { var msg; try { msg = JSON.parse(event.data); } catch (e) { return; } _handleMessage(msg, _send, _legacyCtx()); };
       ws.onclose = function () {
         if (!_transport || _transport.type !== 'ws' || _transport.ws !== ws) return;
         _clientId = null; _transport = null; _setState('disconnected');
@@ -147,7 +162,7 @@
       .then(function (r) { return r.json(); })
       .then(function (messages) {
         if (!Array.isArray(messages)) return;
-        for (var i = 0; i < messages.length; i++) _handleMessage(messages[i]);
+        for (var i = 0; i < messages.length; i++) _handleMessage(messages[i], _send, _legacyCtx());
         _pollLoop();
       })
       .catch(function () {
@@ -156,9 +171,19 @@
       });
   }
 
+  // The state/identity context for the single ws/http transport (legacy, one connection).
+  function _legacyCtx() {
+    return {
+      identity: _identity,
+      onWelcome: function (id) { _clientId = id; _setState('connected'); },
+      onError: function () { _setState('error'); },
+    };
+  }
+
   // ── fs transport (TRANSPORTS.md §3): a page-role FsChannel over an injected
   // FileSystemDirectoryHandle. Reuses fs-channel.js (loaded on the page as the global
-  // GcuFsChannel, e.g. concatenated into the app build). No port, no extension. ──
+  // GcuFsChannel, e.g. concatenated into the app build). No port, no extension.
+  // Multichannel: N channels coexist in _fsChannels, one per folder. ──
 
   function _fsChannelCtor() {
     var g = (typeof GcuFsChannel !== 'undefined') ? GcuFsChannel
@@ -226,42 +251,97 @@
     };
   }
 
-  async function _connectFs(token) {
+  function _emitChannel(entry) {
+    if (_onChannelState) { try { _onChannelState(entry.id, entry.state, entry.identity, entry.clientId); } catch (e) { /* host callback */ } }
+  }
+
+  // Aggregate the fs channels' states into the global _state — but only when no
+  // ws/http transport owns it (the two paths are mutually exclusive in practice).
+  function _recomputeFsState() {
+    if (_transport) return;
+    var any = false, connecting = false;
+    _fsChannels.forEach(function (e) { if (e.state === 'connected') any = true; else if (e.state === 'connecting') connecting = true; });
+    _setState(any ? 'connected' : connecting ? 'connecting' : 'disconnected');
+  }
+
+  // Per-channel state/identity context — onWelcome/onError scoped to one fs channel.
+  function _fsCtx(entry) {
+    return {
+      identity: entry.identity,
+      onWelcome: function (id) { entry.clientId = id; entry.state = 'connected'; _emitChannel(entry); _recomputeFsState(); },
+      onError: function () { entry.state = 'error'; _emitChannel(entry); _recomputeFsState(); },
+    };
+  }
+
+  // Add (or replace, idempotent on id) one fs channel over a folder handle. Each
+  // channel runs its own poll loop and shares the page's _tools registry; replies +
+  // identity route per channel via _fsCtx. opts: { id, handle, token, identity }.
+  async function _addFolder(opts) {
     var FsChannel = _fsChannelCtor();
     if (!FsChannel) throw new Error('fs transport needs fs-channel.js (global GcuFsChannel) on the page');
     if (!(crypto && crypto.subtle)) throw new Error('fs transport needs crypto.subtle (a secure context)');
-    _setState('connecting');
+    var id = (opts && opts.id) || 'default';
+    var token = String((opts && opts.token) || '').replace(/^fs:/, '').trim();
+    if (!opts || !opts.handle) throw new Error('addFolder needs a directory handle');
+    if (!token) throw new Error('addFolder needs the machine token');
+    _removeFolder(id);   // idempotent: re-adding an id replaces it
+    var entry = { id: id, handle: opts.handle, token: token, identity: opts.identity || null, channel: null, clientId: null, state: 'connecting', timer: null, polling: true };
+    _fsChannels.set(id, entry);
+    _emitChannel(entry); _recomputeFsState();
     var hmac = await _fsHmac(token, _effectiveName());
     var channel = new FsChannel({
-      role: 'page', dir: _fsaDir(_folder), hmac: hmac,
+      role: 'page', dir: _fsaDir(opts.handle), hmac: hmac,
       now: function () { return Date.now(); },
       randomId: function () { return _randHex(8); },
-      onMessage: function (msg) { _handleMessage(msg); },
-      onState: function (s) { if (s === 'closed') _setState('disconnected'); },   // 'connected' is set on `welcome`
-      onWarn: function (m) { if (typeof console !== 'undefined') console.warn('[numen] fs:', m); },   // always-on (forged/stale frames)
+      onMessage: function (msg) { _handleMessage(msg, function (o) { channel.send(o); }, _fsCtx(entry)); },
+      onState: function (s) { if (s === 'closed') { entry.state = 'disconnected'; _emitChannel(entry); _recomputeFsState(); } },
+      onWarn: function (m) { if (typeof console !== 'undefined') console.warn('[numen] fs[' + id + ']:', m); },
     });
-    var t = { type: 'fs', channel: channel, token: token, polling: true, timer: null };
-    _transport = t;
+    entry.channel = channel;
     channel.send({ type: 'hello', protocol: PROTOCOL, title: (typeof document !== 'undefined' && document.title) || 'Untitled', name: _effectiveName(), path: (typeof location !== 'undefined' && location.href) || '' });
     channel.send({ type: 'tools_changed', tools: _serializeTools() });
     await channel.start();
     var busy = false;
-    t.timer = setInterval(function () {
-      if (busy || !t.polling) return;
+    entry.timer = setInterval(function () {
+      if (busy || !entry.polling) return;
       busy = true;
       Promise.resolve().then(function () { return channel.tick(); })
-        .catch(function (e) { if (typeof console !== 'undefined') console.error('[numen] fs tick', e); })
+        .catch(function (e) { if (typeof console !== 'undefined') console.error('[numen] fs[' + id + '] tick', e); })
         .then(function () { busy = false; });
     }, FS_POLL_MS);
+    return entry;
   }
 
-  // ── shared message handler ──
+  function _removeFolder(id) {
+    var e = _fsChannels.get(id);
+    if (!e) return;
+    e.polling = false;
+    if (e.timer) { clearInterval(e.timer); e.timer = null; }
+    if (e.channel) { try { e.channel.stop(); } catch (x) { /* ignore */ } }
+    _fsChannels.delete(id);
+    e.state = 'disconnected'; _emitChannel(e);
+    _recomputeFsState();
+  }
 
-  function _handleMessage(msg) {
-    if (msg.type === 'welcome') { _clientId = msg.id; _setState('connected'); }
-    else if (msg.type === 'tool_invoke') { _handleInvoke(msg); }
-    else if (msg.type === 'ping') { _send({ type: 'pong' }); }
-    else if (msg.type === 'error') { console.error('[numen]', msg.message); _setState('error'); }
+  // ── shared message handler (reply + ctx supplied per transport/channel) ──
+
+  function _handleMessage(msg, reply, ctx) {
+    if (msg.type === 'welcome') { ctx.onWelcome(msg.id); }
+    else if (msg.type === 'tool_invoke') { _handleInvoke(msg, reply, ctx.identity); }
+    else if (msg.type === 'ping') { reply({ type: 'pong' }); }
+    else if (msg.type === 'error') { if (typeof console !== 'undefined') console.error('[numen]', msg.message); ctx.onError(); }
+  }
+
+  function _handleInvoke(msg, reply, identity) {
+    var tool = _tools.get(msg.name);
+    if (!tool) { reply({ type: 'tool_result', callId: msg.callId, error: 'Tool not found: ' + msg.name }); return; }
+    // `identity` is the calling channel's (folder = identity) — carried into execution
+    // so a tool can attribute the write (SPEC-librarian §2). null on ws/http.
+    var client = { requestUserInteraction: function (cb) { return cb(); }, identity: identity || null };
+    Promise.resolve()
+      .then(function () { return tool.execute(msg.input || {}, client); })
+      .then(function (result) { reply({ type: 'tool_result', callId: msg.callId, result: result }); })
+      .catch(function (e) { reply({ type: 'tool_result', callId: msg.callId, error: (e && e.message) || String(e) }); });
   }
 
   // ── connect (fs when a folder is injected; else try WS, fall back to HTTP) ──
@@ -269,13 +349,14 @@
   function _connect(portAndToken) {
     // fs transport: a folder handle is injected and the connect datum is just the
     // machine token (no port). The page derives the shared key from token + its name.
+    // This is the single-channel shim over the multichannel core (channel id 'default').
     if (_folder) {
       var fsToken = String(portAndToken || '').replace(/^fs:/, '').trim();
       if (!fsToken) throw new Error('fs transport needs the machine token (gcuWebMCP.connect("<token>"))');
       _portAndToken = portAndToken;
       _teardownTransport();
       clearTimeout(_reconnectTimer);
-      _connectFs(fsToken).catch(function (e) {
+      _addFolder({ id: 'default', handle: _folder, token: fsToken, identity: _identity }).catch(function (e) {
         console.error('[numen] fs connection failed:', e.message || e);
         _setState('error');
         if (_portAndToken) _reconnectTimer = setTimeout(function () { _connect(_portAndToken); }, 5000);
@@ -309,18 +390,9 @@
     _portAndToken = null;
     clearTimeout(_reconnectTimer);
     _teardownTransport();
+    Array.from(_fsChannels.keys()).forEach(_removeFolder);
     _clientId = null;
     _setState('disconnected');
-  }
-
-  function _handleInvoke(msg) {
-    var tool = _tools.get(msg.name);
-    if (!tool) { _send({ type: 'tool_result', callId: msg.callId, error: 'Tool not found: ' + msg.name }); return; }
-    var client = { requestUserInteraction: function (cb) { return cb(); } };
-    Promise.resolve()
-      .then(function () { return tool.execute(msg.input || {}, client); })
-      .then(function (result) { _send({ type: 'tool_result', callId: msg.callId, result: result }); })
-      .catch(function (e) { _send({ type: 'tool_result', callId: msg.callId, error: (e && e.message) || String(e) }); });
   }
 
   // ── polyfill navigator.modelContext ──
@@ -330,17 +402,17 @@
       registerTool: function (tool) {
         if (!tool || !tool.name) throw new Error('Tool must have a name');
         _tools.set(tool.name, tool);
-        if (_state === 'connected') _send({ type: 'tools_changed', tools: _serializeTools() });
+        _broadcastToolsChanged();
       },
       unregisterTool: function (name) {
         _tools.delete(name);
-        if (_state === 'connected') _send({ type: 'tools_changed', tools: _serializeTools() });
+        _broadcastToolsChanged();
       },
       // Re-push the current tool list without a register/unregister — for apps
       // whose tool availability changes without the set changing (e.g. Auditable
       // re-gating tools on notebook lock/unlock).
       notifyToolsChanged: function () {
-        if (_state === 'connected') _send({ type: 'tools_changed', tools: _serializeTools() });
+        _broadcastToolsChanged();
       },
     };
   }
@@ -350,23 +422,35 @@
   var api = {
     connect: _connect,
     disconnect: _disconnect,
-    notify: function (method, params) { _send({ type: 'notification', method: method, params: params }); },
+    // fs multichannel: add/remove a channel by id (folder = identity). Returns a
+    // promise (addFolder). connect()+folder is the single-channel ('default') sugar.
+    addFolder: function (opts) { return _addFolder(opts || {}); },
+    removeFolder: _removeFolder,
+    get channels() { var a = []; _fsChannels.forEach(function (e) { a.push({ id: e.id, identity: e.identity, state: e.state, clientId: e.clientId }); }); return a; },
+    set onChannelState(fn) { _onChannelState = fn || null; },
+    notify: function (method, params) {
+      var obj = { type: 'notification', method: method, params: params };
+      if (_transport) _send(obj);
+      _fsChannels.forEach(function (e) { if (e.channel) e.channel.send(obj); });
+    },
     get state() { return _state; },
     get clientId() { return _clientId; },
     get name() { return _effectiveName(); },
     set name(v) { _name = v || null; },
     get derivedName() { return _derivedName(); },
+    get identity() { return _identity; },
+    set identity(v) { _identity = v || null; },   // default identity for the legacy single fs channel
     get tools() { var n = []; _tools.forEach(function (t) { n.push(t.name); }); return n; },   // registered tool names (introspection)
     invoke: function (name, input) {   // run a registered tool locally (testing / "try it" UIs)
       var t = _tools.get(name);
       if (!t) return Promise.reject(new Error('no such tool: ' + name));
-      return Promise.resolve(t.execute(input || {}, { requestUserInteraction: function (cb) { return cb(); } }));
+      return Promise.resolve(t.execute(input || {}, { requestUserInteraction: function (cb) { return cb(); }, identity: null }));
     },
     set onStateChange(fn) { _onStateChange = fn; },
     get fetch() { return _fetch; },
     set fetch(fn) { _fetch = fn || null; },   // inject gcuFetch for public-origin → localhost
     get folder() { return _folder; },
-    set folder(h) { _folder = h || null; },   // inject a FileSystemDirectoryHandle ⇒ fs transport
+    set folder(h) { _folder = h || null; },   // inject a FileSystemDirectoryHandle ⇒ fs transport (single channel)
   };
   if (typeof window !== 'undefined') {
     window.gcuMCP = api;

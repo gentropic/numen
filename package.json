@@ -10,8 +10,8 @@
   "files": ["numen-bridge.js", "shim.js", "fs-channel.js", "SPEC.md", "TRANSPORTS.md", "README.md"],
   "scripts": {
     "info": "node numen-bridge.js --info",
-    "smoke": "node tools/smoke.mjs && node tools/smoke-fs.mjs && node tools/smoke-fs-bridge.mjs && node tools/smoke-fs-watch.mjs",
-    "smoke:fs": "node tools/smoke-fs.mjs && node tools/smoke-fs-bridge.mjs && node tools/smoke-fs-watch.mjs",
+    "smoke": "node tools/smoke.mjs && node tools/smoke-fs.mjs && node tools/smoke-fs-bridge.mjs && node tools/smoke-fs-watch.mjs && node tools/smoke-fs-multichannel.mjs",
+    "smoke:fs": "node tools/smoke-fs.mjs && node tools/smoke-fs-bridge.mjs && node tools/smoke-fs-watch.mjs && node tools/smoke-fs-multichannel.mjs",
     "e2e": "node tools/e2e-browser.mjs",
     "e2e:fs": "node tools/e2e-fs.mjs",
     "mcpb": "node tools/build-mcpb.mjs"
