@@ -57,6 +57,26 @@
   footer a { margin-right: 16px; }
   .pillrow { margin: 10px 0 0; }
   .pill { display: inline-block; font-family: var(--mono); font-size: 12px; color: var(--muted); border: 1px solid var(--bd); border-radius: 999px; padding: 2px 10px; margin: 0 6px 6px 0; }
+  /* playground */
+  .play { background: var(--panel); border: 1px solid var(--bd); border-radius: 9px; padding: 16px; }
+  .play .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .play label { font-size: 12px; color: var(--muted); }
+  .play select, .play textarea {
+    font-family: var(--mono); font-size: 13px; color: var(--fg);
+    background: var(--bg); border: 1px solid var(--bd); border-radius: 6px; padding: 7px 9px;
+  }
+  .play select { min-width: 130px; }
+  .play textarea { width: 100%; min-height: 60px; margin-top: 8px; resize: vertical; box-sizing: border-box; }
+  .play button {
+    font-family: var(--mono); font-size: 13px; cursor: pointer;
+    background: var(--action); color: #1a1205; border: 0; border-radius: 6px; padding: 8px 16px; font-weight: 600;
+  }
+  .play button:hover { filter: brightness(1.08); }
+  .play .desc { font-size: 12px; color: var(--muted); margin: 8px 0 0; min-height: 1.4em; }
+  .play .result { margin-top: 10px; }
+  .play .result pre { margin: 0; }
+  .play .ok { color: var(--go); } .play .err { color: #ff6b5e; }
+  .play .hint { font-size: 12px; color: var(--muted); margin-top: 12px; }
 </style>
 </head>
 <body>
@@ -128,6 +148,28 @@
     protocol + its security model in TRANSPORTS.
   </p>
 
+  <h2>Try it — this page is a numen surface</h2>
+  <p>
+    This page loads the real <code>shim.js</code> and registers a few harmless demo
+    tools on <code>navigator.modelContext</code> — so it <em>is</em> a numen surface.
+    Run one locally below (no bridge needed; the shim's <code>invoke()</code> path).
+    Connect a bridge per the install above and your Claude can call these same tools.
+  </p>
+  <div class="play" id="play" hidden>
+    <div class="row">
+      <label for="toolSel">tool</label>
+      <select id="toolSel"></select>
+      <button id="runBtn">Invoke</button>
+    </div>
+    <div class="desc" id="toolDesc"></div>
+    <textarea id="toolIn" spellcheck="false" aria-label="tool input (JSON)"></textarea>
+    <div class="result"><pre><code id="toolOut" class="note">— invoke to see a result —</code></pre></div>
+    <p class="hint">These are demo tools (echo · page info · counter) — toy-grade, no
+      filesystem, no real state. The shim connects <em>out</em> to a bridge you configure;
+      nothing here is inbound.</p>
+  </div>
+  <noscript><p class="note">(The interactive demo needs JavaScript. Everything above is static.)</p></noscript>
+
   <footer>
     <a href="https://github.com/gentropic/numen">GitHub</a>
     <a href="https://jsr.io/@gcu/numen">JSR</a>
@@ -138,5 +180,82 @@
   </footer>
 
 </div>
+
+<!-- The real numen shim (sets navigator.modelContext + window.gcuMCP), served
+     same-origin from the repo root. The in-page "try it" below only needs the
+     shim's invoke() path — fs-channel.js (the fs transport) is added as a module
+     when the connect-a-bridge demo lands; classic-loading it would throw on its
+     ESM export. -->
+<script src="./shim.js"></script>
+<script>
+(function () {
+  var mc = navigator.modelContext, ctl = window.gcuMCP || window.gcuWebMCP;
+  if (!mc || typeof mc.registerTool !== 'function' || !ctl) return;   // no shim → leave the static note
+
+  // ── harmless demo tools (toy-grade: no fs, no real state) ──
+  var hits = 0;
+  mc.registerTool({
+    name: 'echo',
+    description: 'Echo your input back — the simplest possible tool.',
+    inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+    execute: function (i) { return { echoed: (i && i.text) || '' }; },
+  });
+  mc.registerTool({
+    name: 'pageInfo',
+    description: 'Report this surface: title, URL, and the tools registered on it.',
+    inputSchema: { type: 'object', properties: {} },
+    execute: function () { return { title: document.title, url: location.href, tools: ctl.tools }; },
+  });
+  mc.registerTool({
+    name: 'counter',
+    description: 'Increment an in-page counter — shows tool calls carry state across invocations.',
+    inputSchema: { type: 'object', properties: { by: { type: 'integer' } } },
+    execute: function (i) { hits += (i && typeof i.by === 'number') ? i.by : 1; return { count: hits }; },
+  });
+
+  var examples = { echo: { text: 'hello, numen' }, pageInfo: {}, counter: { by: 1 } };
+  var descs = {};   // name → description (for the desc line)
+
+  var play = document.getElementById('play');
+  var sel = document.getElementById('toolSel');
+  var ta = document.getElementById('toolIn');
+  var out = document.getElementById('toolOut');
+  var desc = document.getElementById('toolDesc');
+  var btn = document.getElementById('runBtn');
+  play.hidden = false;
+
+  // populate from the live registry
+  (ctl.tools || []).forEach(function (name) {
+    var o = document.createElement('option'); o.value = name; o.textContent = name; sel.appendChild(o);
+  });
+  // capture descriptions by invoking nothing — read from our known set
+  descs.echo = 'Echo your input back — the simplest possible tool.';
+  descs.pageInfo = 'Report this surface: title, URL, and the tools registered on it.';
+  descs.counter = 'Increment an in-page counter — state across invocations.';
+
+  function sync() {
+    var name = sel.value;
+    desc.textContent = descs[name] || '';
+    ta.value = JSON.stringify(examples[name] || {}, null, 2);
+  }
+  sel.addEventListener('change', sync);
+  sync();
+
+  btn.addEventListener('click', async function () {
+    var name = sel.value, input;
+    try { input = ta.value.trim() ? JSON.parse(ta.value) : {}; }
+    catch (e) { out.className = 'err'; out.textContent = 'input is not valid JSON: ' + e.message; return; }
+    out.className = 'note'; out.textContent = 'running…';
+    try {
+      var r = await ctl.invoke(name, input);
+      out.className = 'ok';
+      out.textContent = JSON.stringify(r, null, 2);
+    } catch (e) {
+      out.className = 'err';
+      out.textContent = 'error: ' + ((e && e.message) || e);
+    }
+  });
+})();
+</script>
 </body>
 </html>
