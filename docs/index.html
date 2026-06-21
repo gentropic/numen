@@ -39,7 +39,14 @@
     padding: 14px 16px; overflow-x: auto; margin: 12px 0;
   }
   pre code { background: none; border: none; padding: 0; }
-  pre.diagram { color: var(--muted); }
+  .diagram-wrap { overflow-x: auto; margin: 20px 0; }
+  .diagram { display: inline-flex; align-items: center; gap: 2px; min-width: 100%; justify-content: center; font-family: var(--mono); }
+  .dbox { background: var(--panel); border: 1px solid var(--bd); border-radius: 8px; padding: 9px 15px; text-align: center; white-space: nowrap; }
+  .dbox b { display: block; font-size: 13px; font-weight: 600; color: var(--fg); }
+  .dbox span { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .dconn { display: flex; flex-direction: column; align-items: center; padding: 0 8px; }
+  .dconn .lbl { font-size: 10px; color: var(--muted); white-space: nowrap; margin-bottom: 2px; }
+  .dconn .arr { font-size: 13px; color: var(--info); letter-spacing: -1px; }
   .lead { font-size: 17px; color: var(--fg); }
   .note { color: var(--muted); font-size: 14px; }
   .two { display: grid; gap: 14px; }
@@ -73,12 +80,15 @@
     MCP server per app. A Claude session sees only that surface's tools; no crosstalk.
   </p>
 
-  <pre class="diagram"><code>┌──────────────────┐
-│  surface (browser)│──WS/HTTP/fs──┐   ┌───────────────┐  stdio   ┌──────────────┐
-└──────────────────┘              ├──►│  numen-bridge  │◄────────►│ Claude (any  │
-┌──────────────────┐              │   │  (node, zero   │   MCP    │  MCP client) │
-│  another surface  │──WS/HTTP/fs──┘   │   deps)        │          └──────────────┘
-└──────────────────┘                  └───────────────┘</code></pre>
+  <div class="diagram-wrap">
+    <div class="diagram">
+      <div class="dbox"><b>surface</b><span>browser · loads the shim</span></div>
+      <div class="dconn"><span class="lbl">WS · HTTP · fs</span><span class="arr">◄───►</span></div>
+      <div class="dbox"><b>numen-bridge</b><span>node · zero deps</span></div>
+      <div class="dconn"><span class="lbl">stdio · MCP</span><span class="arr">◄───►</span></div>
+      <div class="dbox"><b>Claude</b><span>any MCP client</span></div>
+    </div>
+  </div>
 
   <h2>Install</h2>
   <div class="two">
