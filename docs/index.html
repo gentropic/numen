@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>@gcu/numen — connect GCU surfaces to Claude</title>
+<meta name="description" content="The zero-dependency MCP bridge that connects GCU browser surfaces (Auditable Works, weir, …) to Claude Code, Claude Desktop, or any MCP client.">
+<style>
+  :root {
+    --bg: #15171a; --panel: #1c1f24; --bd: #2b2f36;
+    --fg: #e6e8ea; --muted: #9aa3ad;
+    --action: #ff7a33; --info: #46c8c0; --go: #6fcf6f;
+    --mono: ui-monospace, "Space Mono", "SF Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, "Barlow", system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html { color-scheme: dark; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: var(--sans); line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 820px; margin: 0 auto; padding: 48px 20px 80px; }
+  header { border-bottom: 1px solid var(--bd); padding-bottom: 22px; margin-bottom: 28px; }
+  h1 { font-family: var(--mono); font-size: 30px; margin: 0 0 6px; letter-spacing: -0.5px; }
+  h1 .at { color: var(--action); }
+  .tag { color: var(--muted); font-size: 16px; margin: 0; }
+  h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.14em;
+    color: var(--action); margin: 38px 0 12px;
+  }
+  p { margin: 12px 0; }
+  a { color: var(--info); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code { font-family: var(--mono); font-size: 0.92em; background: var(--panel); border: 1px solid var(--bd); border-radius: 4px; padding: 1px 5px; }
+  pre {
+    font-family: var(--mono); font-size: 13px; line-height: 1.5;
+    background: var(--panel); border: 1px solid var(--bd); border-radius: 7px;
+    padding: 14px 16px; overflow-x: auto; margin: 12px 0;
+  }
+  pre code { background: none; border: none; padding: 0; }
+  pre.diagram { color: var(--muted); }
+  .lead { font-size: 17px; color: var(--fg); }
+  .note { color: var(--muted); font-size: 14px; }
+  .two { display: grid; gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--bd); border-radius: 8px; padding: 14px 16px; }
+  .card h3 { margin: 0 0 6px; font-size: 15px; }
+  .card h3 .badge { font-size: 11px; color: var(--go); border: 1px solid var(--go); border-radius: 4px; padding: 0 5px; margin-left: 6px; vertical-align: middle; }
+  footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--bd); color: var(--muted); font-size: 14px; }
+  footer a { margin-right: 16px; }
+  .pillrow { margin: 10px 0 0; }
+  .pill { display: inline-block; font-family: var(--mono); font-size: 12px; color: var(--muted); border: 1px solid var(--bd); border-radius: 999px; padding: 2px 10px; margin: 0 6px 6px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1><span class="at">@gcu/</span>numen</h1>
+    <p class="tag">Connect GCU browser surfaces to Claude — the official, zero-dependency MCP bridge.</p>
+    <div class="pillrow">
+      <span class="pill">Claude Code</span>
+      <span class="pill">Claude Desktop</span>
+      <span class="pill">any MCP client</span>
+      <span class="pill">node · bun · deno</span>
+      <span class="pill">zero deps</span>
+    </div>
+  </header>
+
+  <p class="lead">
+    numen fronts <em>our</em> surfaces — <a href="https://github.com/gentropic/auditable">Auditable&nbsp;Works</a>,
+    weir, anything that loads the shim — with one bridge, instead of a hand-written
+    MCP server per app. A Claude session sees only that surface's tools; no crosstalk.
+  </p>
+
+  <pre class="diagram"><code>┌──────────────────┐
+│  surface (browser)│──WS/HTTP/fs──┐   ┌───────────────┐  stdio   ┌──────────────┐
+└──────────────────┘              ├──►│  numen-bridge  │◄────────►│ Claude (any  │
+┌──────────────────┐              │   │  (node, zero   │   MCP    │  MCP client) │
+│  another surface  │──WS/HTTP/fs──┘   │   deps)        │          └──────────────┘
+└──────────────────┘                  └───────────────┘</code></pre>
+
+  <h2>Install</h2>
+  <div class="two">
+    <div class="card">
+      <h3>Claude Code</h3>
+      <p class="note">One line — runs the bridge straight from GitHub, no clone:</p>
+      <pre><code>claude mcp add works --scope user -- \
+  npx -y github:gentropic/numen --app works --transport fs</code></pre>
+      <p class="note">Swap <code>--app works</code> for any surface (<code>weir</code>, <code>auditable</code>, …).</p>
+    </div>
+    <div class="card">
+      <h3>Claude Desktop <span class="badge">one-click</span></h3>
+      <p class="note">Build the bundle and double-click it (Settings → Extensions → Install). One multi-surface bridge, run by Desktop's bundled Node — nothing else to install:</p>
+      <pre><code>npm run mcpb   # → dist/numen.mcpb</code></pre>
+      <p class="note">Or add an <code>mcpServers</code> entry to <code>claude_desktop_config.json</code> by hand — see the README.</p>
+    </div>
+  </div>
+
+  <h2>The other half: connect the page</h2>
+  <p>
+    The bridge config is only half the wiring — the <strong>surface</strong> connects on its
+    side. In <strong>Auditable Works</strong>: <code>Settings → Agent&nbsp;access</code> to paste a
+    <code>port:token</code> (socket), or <code>Tools → "Connect agent folder…"</code> (fs). The agent
+    then drives the desktop, reaches any package's verbs, and searches the embedded docs — every
+    action gated, consented, and audited.
+  </p>
+  <p class="note">
+    Full page-side walkthrough + the tool catalog:
+    <a href="https://github.com/gentropic/auditable/blob/main/docs/works-agent.md">Auditable Works → Agent Access</a>.
+  </p>
+
+  <h2>Two transports</h2>
+  <p>
+    The localhost <strong>socket</strong> (ws/http), and <strong><code>fs</code></strong> — the same
+    protocol over a shared folder, with no port and no extension (the pick for a public-origin PWA,
+    and it reaches another machine if you sync the folder). Design + topology in the SPEC; the fs
+    protocol + its security model in TRANSPORTS.
+  </p>
+
+  <footer>
+    <a href="https://github.com/gentropic/numen">GitHub</a>
+    <a href="https://jsr.io/@gcu/numen">JSR</a>
+    <a href="https://github.com/gentropic/numen/blob/main/SPEC.md">SPEC</a>
+    <a href="https://github.com/gentropic/numen/blob/main/TRANSPORTS.md">Transports</a>
+    <a href="https://github.com/gentropic/auditable/blob/main/docs/works-agent.md">Works · Agent Access</a>
+    <div style="margin-top:14px">Geoscientific Chaos Union — MIT. numen: the indwelling spirit that moves a thing.</div>
+  </footer>
+
+</div>
+</body>
+</html>

@@ -81,6 +81,23 @@ that folder** → **paste the token** → **connect over folder**. The page reme
   fetch). `bun` runs the bridge unmodified too.
 - Once on npm, the node line also becomes `npx -y @gcu/numen …`.
 
+### For Auditable Works / notebooks
+
+Use `--app works` (the [Auditable Works](https://github.com/gentropic/auditable)
+desktop) or `--app auditable` (a standalone notebook) — e.g.:
+
+```
+claude mcp add works --scope user -- npx -y github:gentropic/numen --app works --transport fs
+```
+
+The bridge config is only half the story; the **page side** connects in the
+surface itself. In Works: **Settings → Agent access** to paste a `port:token`
+(socket transport), or **Tools → "Connect agent folder…"** (fs transport). The
+agent then drives the desktop (files, surfaces, notebooks), reaches any package's
+verbs, and searches the embedded docs — all gated/consented/audited. Full
+page-side walkthrough + the tool catalog:
+[**Auditable Works → Agent Access**](https://github.com/gentropic/auditable/blob/main/docs/works-agent.md).
+
 ## Quick start (wiring an app, e.g. weir)
 
 1. **Vendor `shim.js`** — and **`fs-channel.js`** if you want the fs transport —
