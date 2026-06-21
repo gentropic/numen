@@ -437,6 +437,26 @@ ergonomic typed `weir_*` tools, while index-only hosts fall back to `listTools` 
 tool-design dispatcher (a surface's own tools should still be distinct verbs, not one
 `{action}` tool). Proven by `tools/smoke.mjs`.
 
+### 6.5 Multichannel — many bridges, one page (one folder each) **[implemented, 0.1.3]**
+
+A single page can serve **more than one bridge at once** — e.g. weir driven by both a
+*librarian* agent and a *dev* agent simultaneously. The `fs` channel is single-occupancy
+*per folder* by construction (one root `bridge.live` announce, one adopted session — §3.2),
+so two bridges on the *same* folder clobber each other. The fix is **N folders, N channels,
+one page**: each bridge gets its own folder, the page runs one `FsChannel` per folder, and
+they share the page's tool registry. The bridge and `fs-channel.js` (protocol + crypto) are
+**unchanged** — this is purely page-side (`shim.js`): `gcuMCP.addFolder({id, handle, token,
+identity})` / `removeFolder(id)` / `channels`, with `connect()`+`folder` kept as the
+single-channel (`'default'`) sugar. Replies route back to the calling channel, and the
+calling channel's `identity` is carried into `tool.execute(input, client)` as
+`client.identity`.
+
+This makes **folder = identity** literal (§5): each folder = one agent = one machine token,
+and that identity is exactly what a surface needs to attribute writes (weir stamps
+`source:'agent'` + `by: client.identity` — GLASS §17.2). Proven by
+`tools/smoke-fs-multichannel.mjs`. Full design record: [docs/multichannel.md](docs/multichannel.md).
+(Distinct from §6.3's *one bridge → many surfaces*; this is *many bridges → one surface*.)
+
 ---
 
 ## 7. WebRTC upgrade — v1.5 seam (spec now, build next)
