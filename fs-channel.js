@@ -11,7 +11,10 @@
 //   now       () -> epoch ms
 //   randomId  () -> hex string            — session (bridge) / epoch (page) nonces
 //   onMessage (wireMsg) -> void           — deliver a verified inbound message
-//   onState   ('connecting'|'open'|'closed') -> void
+//   onState   ('connecting'|'open'|'offline'|'closed') -> void
+//             'offline' (page only) = a bridge.live is present but its heartbeat is stale
+//             (> LIVENESS_MS) — the bridge PROCESS is down, so we're not merely "connecting".
+//             Auto-recovers to 'open' when the bridge refreshes bridge.live again.
 //
 // Roles: the BRIDGE announces (writes `bridge.live`); the PAGE dials. Layout:
 //
@@ -143,8 +146,9 @@ const GcuFsChannel = (function () {
   };
 
   // page: read + verify bridge.live; adopt the session (minting a fresh epoch) when
-  // it first appears or changes. Returns false if no live, unverifiable, or stale
-  // bridge (→ the bridge is presumed down).
+  // it first appears or changes. Returns true if live, false if absent/unverifiable
+  // (still dialing), or 'stale' if a valid announce exists but its heartbeat is old
+  // (→ the bridge PROCESS is presumed down — distinct from "no bridge yet").
   FsChannel.prototype._discover = async function () {
     var raw = await this._dir.read('bridge.live');
     if (raw == null) return false;
@@ -155,7 +159,7 @@ const GcuFsChannel = (function () {
     if (typeof b.session !== 'string' || !SEG_RE.test(b.session)) { this._warn('announce has an unsafe session id — ignored'); return false; }
     var expect = await this._hmac(canon(b.session, '-', 'announce', 0, b.ts, ann.payload.length, ann.payload));
     if (!ctEq(expect, ann.sig)) { this._warn('bad announce HMAC (forged bridge.live?) — ignored'); return false; }
-    if (this._now() - b.ts > LIVENESS_MS) { this._log('bridge.live stale — bridge presumed down'); return false; }
+    if (this._now() - b.ts > LIVENESS_MS) { this._log('bridge.live stale — bridge presumed down'); return 'stale'; }
     if (this.session !== b.session) {            // first sight or a bridge restart → fresh connection
       this.session = b.session;
       this.epoch = this._rand();
@@ -261,7 +265,8 @@ const GcuFsChannel = (function () {
       if (!this.epoch) return;                                           // no page has dialled yet
     } else {
       var ok = await this._discover();
-      if (!ok) { this._setState('connecting'); return; }
+      if (ok === 'stale') { this._setState('offline'); return; }         // bridge.live present but heartbeat dead → bridge process down (not just dialing)
+      if (!ok) { this._setState('connecting'); return; }                 // no/forged announce → still dialing
       this._setState('open');                                            // the bridge is announcing
     }
     if (!this.session || !this.epoch) return;

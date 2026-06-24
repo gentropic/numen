@@ -294,7 +294,18 @@
       now: function () { return Date.now(); },
       randomId: function () { return _randHex(8); },
       onMessage: function (msg) { _handleMessage(msg, function (o) { channel.send(o); }, _fsCtx(entry)); },
-      onState: function (s) { if (s === 'closed') { entry.state = 'disconnected'; _emitChannel(entry); _recomputeFsState(); } },
+      onState: function (s) {
+        // entry.state is normally driven by the app-level handshake (onWelcome→connected /
+        // onError→error); the channel transport states we surface are: 'closed'→disconnected,
+        // and 'offline' (bridge.live heartbeat stale → bridge process down) so the host can show
+        // it honestly instead of an eternal "connecting". 'open' after 'offline' = the bridge
+        // returned → back to handshaking ('connecting'; onWelcome will re-confirm 'connected').
+        var next = s === 'closed' ? 'disconnected'
+          : s === 'offline' ? 'offline'
+          : (s === 'open' && entry.state === 'offline') ? 'connecting'
+          : null;
+        if (next && next !== entry.state) { entry.state = next; _emitChannel(entry); _recomputeFsState(); }
+      },
       onWarn: function (m) { if (typeof console !== 'undefined') console.warn('[numen] fs[' + id + ']:', m); },
     });
     entry.channel = channel;
