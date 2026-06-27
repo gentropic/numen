@@ -4,8 +4,12 @@
 > folder** (TRANSPORTS §6.5): N agents ⇒ N folders. This makes it **N bridges per folder** —
 > a folder becomes a multi-occupancy channel — **without** changing the identity model
 > (identity stays *folder-scoped*, set by the consumer; see §3, the load-bearing decision).
-> Status: **PROPOSED, not built.** Supersedes [multichannel.md]'s §1.1 "(B) is rejected" — the
-> rejection was right *then* (it implied touching the crypto); the insight below makes it small.
+> Status: **Phase 1 (channel core) BUILT + TESTED (2026-06-27); Phase 2 (shim + weir) pending.**
+> `fs-channel.js` ships per-bridge announces + `listAnnounces()` + the pinned page mode;
+> `smoke-fs-shared-folder` (two bridges, one folder, independent routing) + the full suite green.
+> The bureau is unaffected until Phase 2 — live channels still ride the legacy `bridge.live`, which
+> the bridge keeps mirroring. Supersedes [multichannel.md]'s §1.1 "(B) is rejected" — the rejection was
+> right *then* (it implied touching the crypto); the §0 insight makes it small.
 
 ## 0. The insight — the frames are already per-session
 
@@ -73,27 +77,35 @@ So:
 - **Stale reaping.** An announce older than `LIVENESS_MS` ⇒ its sub-channel is dropped; the
   page MAY unlink a clearly-dead `live/<session>.json` (it only ever removes already-authenticated
   entries — same rule as epoch reaping today; never rmrf on unverified input, §4 confused-deputy).
-- **Backward compat (lockstep, but graceful).** The page reads **`live/*.json` AND** the legacy
-  root **`bridge.live`** — so an *old* single-folder bridge (writes `bridge.live`) still connects
-  to a *new* page. A *new* bridge writes only `live/<session>.json`; an *old* page (reads only
-  `bridge.live`) won't see it — acceptable, since weir vendors the shim and updates in lockstep
-  with numen. No dual-write (that would re-introduce the clobber).
+- **Backward compat — dual-write (what shipped).** The bridge writes **both** `live/<session>.json`
+  (the new per-bridge announce) **and** the legacy `bridge.live` (a mirror). The page's
+  `_readAnnounces` reads **both** (deduped by session). So *every* combination works: new bridge ↔
+  old page (via the mirrored `bridge.live`), old bridge ↔ new page (via the legacy read), new ↔ new
+  (via `live/`). Crucially, **every legacy reader keeps working untouched** — the §6.3 coexistence
+  guard, `smoke-fs-coexist`, weir's channel reset + `weir_mcpDiag` all still read `bridge.live`, which
+  is still written. In a >1-bridge folder the legacy `bridge.live` just *flaps* between the bridges'
+  announces — harmless, because multi-bridge pages read `live/` and ignore it. (A later cleanup can
+  drop the `bridge.live` write once nothing reads it; for now it's the zero-break transition.)
+- **Litter.** A bridge restart leaves a stale `live/<oldsession>.json` (the page filters stale by
+  `ts`, so it's ignored — just litter). A TTL reap of clearly-dead announces is a Phase 2 nicety
+  (same "never rmrf unverified input" rule as epoch reaping).
 - **The §6.3 coexistence guard becomes mostly moot** for shared folders: bridges no longer fight
   over one `bridge.live`, so they don't need to yield. The guard stays for the *watch-keys-by-
   basename* topology, but "two bridges, one folder" is now first-class, not a hazard.
 
 ## 5. Build plan
 
-1. `fs-channel.js`: announce write → `live/<session>.json`; add a page **pinned-session** ctor
-   option; expose a static `listAnnounces(dir)` (scan + verify) for the shim. Keep `bridge.live`
-   read as a legacy fallback.
-2. `shim.js`: per-channel sub-channel map; scan `live/` each tick; add/drop sub-channels;
-   per-sub-channel `clientId`, all carrying the channel's identity.
-3. `numen-bridge.js`: single-folder + watch both write `live/<session>.json` (one announce each).
-4. Smokes: `smoke-fs-shared-folder.mjs` — TWO bridges on ONE folder, page sees BOTH clients,
-   tool calls route to each, one bridge dies → its sub-channel drops, the other survives. Keep
-   `smoke-fs-multichannel` (N folders) + `smoke-fs-coexist` green.
-5. TRANSPORTS §6.5 + this doc graduate; bump the shim/`.mcpb` minor.
+1. ✅ **DONE** — `fs-channel.js`: announce dual-writes `live/<session>.json` + `bridge.live`;
+   `_readAnnounces()` scans+verifies both (deduped); `listAnnounces()` (instance) returns the live
+   set, freshest first; the **pinned-session** page ctor option (`opts.session`) skips discovery.
+   (Step 3 fell out for free — both single-folder and watch bridges announce via `_announce`.)
+2. `shim.js`: per-channel sub-channel map; scan `live/` each tick (`listAnnounces`); add/drop pinned
+   sub-channels; per-sub-channel `clientId`, all carrying the channel's identity. **[Phase 2]**
+4. ✅ **DONE** — `smoke-fs-shared-folder.mjs`: two bridges, one folder, page lists BOTH and routes
+   independently to each. Full suite green (no regression — the dual-write keeps legacy readers happy).
+   *Pending Phase 2:* a one-bridge-dies → sub-channel-drops case once the shim does lifecycle.
+5. Re-vendor `fs-channel.js` (+ `shim.js`) into weir; weir's reset/diag already read `bridge.live`
+   (still written) so they're unaffected; TRANSPORTS §6.5 + this doc graduate; bump the `.mcpb` minor. **[Phase 2]**
 
 ## 6. Non-goals
 

@@ -83,6 +83,10 @@ const GcuFsChannel = (function () {
     this._warn = opts.onWarn || opts.log || function () {};
     this.session = null;
     this.epoch = null;
+    // Page pinned to ONE bridge session — the host (shim) discovered it via listAnnounces and
+    // runs one channel per live bridge (N bridges, one folder). When set, the page skips
+    // self-discovery. docs/multichannel-shared-folder.md.
+    this._pinnedSession = opts.session || null;
     this.state = 'connecting';
     this._outSeq = 0;
     this._lastIn = -1;                 // highest inbound seq delivered (replay/order guard)
@@ -117,8 +121,47 @@ const GcuFsChannel = (function () {
     var ts = this._now();
     var payload = JSON.stringify({ v: FS_VERSION, session: this.session, ts: ts });
     var sig = await this._hmac(canon(this.session, '-', 'announce', 0, ts, payload.length, payload));
-    await this._dir.write('bridge.live', JSON.stringify({ payload: payload, sig: sig }));  // sign the RAW string
+    var rec = JSON.stringify({ payload: payload, sig: sig });   // sign the RAW string
+    // Per-bridge announce: each bridge owns `live/<session>.json`, so N bridges share one
+    // folder (docs/multichannel-shared-folder.md). We ALSO mirror to the legacy single
+    // `bridge.live` so an un-upgraded page (reads only bridge.live) still connects; a folder
+    // with >1 live bridge merely flaps that legacy file, which multi-bridge pages ignore.
+    try { await this._dir.mkdirp('live'); } catch (e) { /* best effort */ }
+    await this._dir.write('live/' + this.session + '.json', rec);
+    await this._dir.write('bridge.live', rec);
     this._lastAnnounce = ts;
+  };
+
+  // Read + verify EVERY announce in the folder (`live/<session>.json` + legacy `bridge.live`),
+  // deduped by session; forged/garbage are skipped (warned). Each result is
+  // `{ session, ts, stale }` (stale = heartbeat older than the liveness window).
+  FsChannel.prototype._readAnnounces = async function () {
+    var files = [], seen = {}, out = [], names = [];
+    try { names = await this._dir.list('live'); } catch (e) { names = []; }
+    for (var i = 0; i < names.length; i++) if (/\.json$/.test(names[i])) files.push('live/' + names[i]);
+    files.push('bridge.live');                                  // legacy single-bridge announce
+    for (var k = 0; k < files.length; k++) {
+      var raw = await this._dir.read(files[k]);
+      if (raw == null) continue;
+      var ann; try { ann = JSON.parse(raw); } catch (e) { continue; }
+      if (!ann || typeof ann.payload !== 'string') continue;
+      var b; try { b = JSON.parse(ann.payload); } catch (e) { continue; }
+      if (!b || b.v !== FS_VERSION || typeof b.session !== 'string' || !SEG_RE.test(b.session)) continue;
+      if (seen[b.session]) continue;                            // live/ + bridge.live may carry the same session
+      var expect = await this._hmac(canon(b.session, '-', 'announce', 0, b.ts, ann.payload.length, ann.payload));
+      if (!ctEq(expect, ann.sig)) { this._warn('bad announce HMAC (forged announce?) — ignored'); continue; }
+      seen[b.session] = true;
+      out.push({ session: b.session, ts: b.ts, stale: (this._now() - b.ts > LIVENESS_MS) });
+    }
+    return out;
+  };
+
+  // Public (page): every LIVE bridge session in this folder, freshest first. The host (shim)
+  // runs one channel PINNED to each — N bridges, one folder — instead of the single-bridge
+  // _discover. docs/multichannel-shared-folder.md.
+  FsChannel.prototype.listAnnounces = async function () {
+    var all = await this._readAnnounces();
+    return all.filter(function (a) { return !a.stale; }).sort(function (a, b) { return b.ts - a.ts; });
   };
 
   // bridge: adopt a (re)connecting page's epoch — but ONLY one whose hello (to-bridge/0)
@@ -150,17 +193,12 @@ const GcuFsChannel = (function () {
   // (still dialing), or 'stale' if a valid announce exists but its heartbeat is old
   // (→ the bridge PROCESS is presumed down — distinct from "no bridge yet").
   FsChannel.prototype._discover = async function () {
-    var raw = await this._dir.read('bridge.live');
-    if (raw == null) return false;
-    var ann; try { ann = JSON.parse(raw); } catch (e) { return false; }
-    if (!ann || typeof ann.payload !== 'string') return false;
-    var b; try { b = JSON.parse(ann.payload); } catch (e) { return false; }
-    if (!b || b.v !== FS_VERSION) return false;
-    if (typeof b.session !== 'string' || !SEG_RE.test(b.session)) { this._warn('announce has an unsafe session id — ignored'); return false; }
-    var expect = await this._hmac(canon(b.session, '-', 'announce', 0, b.ts, ann.payload.length, ann.payload));
-    if (!ctEq(expect, ann.sig)) { this._warn('bad announce HMAC (forged bridge.live?) — ignored'); return false; }
-    if (this._now() - b.ts > LIVENESS_MS) { this._log('bridge.live stale — bridge presumed down'); return 'stale'; }
-    if (this.session !== b.session) {            // first sight or a bridge restart → fresh connection
+    var all = await this._readAnnounces();
+    if (!all.length) return false;                                   // no/forged announce → still dialing
+    var live = all.filter(function (a) { return !a.stale; }).sort(function (a, b) { return b.ts - a.ts; });
+    if (!live.length) { this._log('announce(s) stale — bridge presumed down'); return 'stale'; }
+    var b = live[0];                                                 // adopt the freshest live bridge
+    if (this.session !== b.session) {            // first sight or a bridge restart/switch → fresh connection
       this.session = b.session;
       this.epoch = this._rand();
       this._resetConn();
@@ -263,9 +301,18 @@ const GcuFsChannel = (function () {
       if (this._now() - this._lastAnnounce > ANNOUNCE_INTERVAL_MS) await this._announce();  // slow refresh — the only periodic write
       await this._adoptEpoch();
       if (!this.epoch) return;                                           // no page has dialled yet
+    } else if (this._pinnedSession) {                                    // host pinned us to one bridge (multi-bridge folder)
+      if (this.session !== this._pinnedSession) {                        // first tick → mint the epoch, dial in
+        this.session = this._pinnedSession;
+        this.epoch = this._rand();
+        this._resetConn();
+        await this._dir.mkdirp(this._epochDir('to-bridge'));
+        await this._dir.mkdirp(this._epochDir('to-page'));
+      }
+      this._setState('open');                                           // liveness is the host's job (it drops us when the announce goes stale)
     } else {
       var ok = await this._discover();
-      if (ok === 'stale') { this._setState('offline'); return; }         // bridge.live present but heartbeat dead → bridge process down (not just dialing)
+      if (ok === 'stale') { this._setState('offline'); return; }         // announce present but heartbeat dead → bridge process down (not just dialing)
       if (!ok) { this._setState('connecting'); return; }                 // no/forged announce → still dialing
       this._setState('open');                                            // the bridge is announcing
     }
