@@ -31,8 +31,15 @@ Read the real surfaces; the code is the contract.
   announce, one adopted session per folder, HMAC-authenticated. It's single-occupancy
   *per folder* by design (sessions handle bridge restart; epochs handle page reload —
   not concurrent agents). N folders = N independent instances of this, untouched.
-- `numen/numen-bridge.js` — the bridge. **No change needed**: `--folder <dir>` is
-  already per-instance. Two bridges already coexist *if* they use different folders.
+- `numen/numen-bridge.js` — the bridge. `--folder <dir>` is per-instance; two bridges
+  coexist *if* they use different folders. **Update (2026-06-27):** this was true for
+  single-folder bridges, but **watch mode** (`--watch`, added after this spec — TRANSPORTS
+  §6.3) DID gain a **coexistence guard** so a Desktop watch over a parent can run alongside
+  the per-folder Code bridges without clobbering them (`smoke-fs-coexist.mjs`). Also note the
+  keying edge this spec's §5 foreshadows: the key is `token + APP NAME` (not the channel/folder
+  id), so single-folder bridges set it with `--app weir` (folder name free), but **watch keys
+  by folder basename** — a watch-served weir channel folder must therefore be **named `weir`**
+  (e.g. Cowork at `~/numen-cowork/weir`). See TRANSPORTS §6.3's "Watch × multichannel keying."
 - `weir/src/js/fsmount.js` — **keyed** FSA handle persistence: `loadHandle(key)` /
   `saveHandle(handle, key)` / `pickDirectory(id)`. Default store = `'dir'`; the
   webmcp fs handle = `'webmcp-fs'`; the Courier already uses `courier:<id>`. A second

@@ -411,9 +411,35 @@ isolation — flagged, not silent):
   one `.mcpb` install (§9): `--transport fs --watch ~/webmcp`, no per-app bundle needed.
   The `--allow` capability gate still bounds what any connected surface can do.
 
-A **`--token` / `GCU_WEBMCP_TOKEN` override** lets the `.mcpb` inject a *user-set* token
+A **`--token` / `NUMEN_TOKEN` override** lets the `.mcpb` inject a *user-set* token
 (host-kept in the OS keychain, surfaced for the user to paste into each page) instead of
-the auto-created `~/.gcu/webmcp.json` one — which a no-shell Desktop user can't read back.
+the auto-created `~/.gcu/numen.json` one — which a no-shell Desktop user can't read back.
+**Use the EXISTING machine token, not a fresh secret:** the `.mcpb` dialog reads as
+"choose a strong secret," but on a machine that already runs Code-seat bridges the token
+must equal the one in `~/.gcu/numen.json` (and the value pasted into each page), or the
+HMAC won't verify. A brand-new token silently breaks every channel.
+
+**Coexistence guard (added 2026-06-27, `smoke-fs-coexist.mjs`).** Watch mode now **skips
+any subfolder that already carries a fresh foreign `bridge.live`** (another bridge's
+announce, within the liveness window) and **reclaims it once that announce goes stale** —
+so a Desktop watch over a parent can run *alongside* the per-folder Claude Code bridges
+(§6.5) without the two clobbering each other's `bridge.live`. (Known limit: it handles the
+common order — the per-folder bridge is already live when watch starts; a foreign bridge
+that appears *after* watch has claimed a folder isn't yet yielded, which would need surface
+teardown. And don't run two *watch* bridges over the same parent — they can race the first
+scan.) This is the only change to `numen-bridge.js` the multichannel arc required.
+
+**⚠ Watch × multichannel keying — a sharp edge.** Watch keys a folder by its **basename**
+(= app id). But a §6.5 multichannel surface keys *every* channel by the **page's app name**
+(weir keys all its channels `numen-fs|weir`; the per-folder Code bridges match with
+`--app weir`, so *their* folder names are free). So to serve a multichannel channel **via
+watch**, the folder must be **named the app** — e.g. a Cowork-on-Desktop weir channel lives
+at `~/numen-cowork/weir` (basename `weir`), **not** `~/numen/cowork` (which keys
+`numen-fs|cowork` → the page rejects the announce as `bad announce HMAC`). The single-folder
+form (`--folder <dir> --app weir`) avoids this (folder name is free); a future
+`--watch … --app <name>` override would too (§10, open). This edge cost a long debug — if a
+channel sits at `connecting`/`bad HMAC`, check the **app id both sides keyed on** before the
+token (read the on-disk `bridge.live` sig; weir ships `weir_mcpDiag`, §6.5).
 
 ### 6.4 Static dispatch pair — cross-host tool discovery
 
@@ -456,6 +482,24 @@ and that identity is exactly what a surface needs to attribute writes (weir stam
 `source:'agent'` + `by: client.identity` — GLASS §17.2). Proven by
 `tools/smoke-fs-multichannel.mjs`. Full design record: [docs/multichannel.md](docs/multichannel.md).
 (Distinct from §6.3's *one bridge → many surfaces*; this is *many bridges → one surface*.)
+
+**One bridge per channel folder — don't share.** Each channel folder is single-occupancy
+(§3.2): exactly one bridge may own its `bridge.live`. Two bridges on one folder flap the
+announce → the page churns reconnects. So two agents = two *folders*, never one shared
+folder (the §6.3 guard enforces this for watch; for hand-run bridges it's on you). A Desktop
+host that spawns a *second* session's bridge over the same parent is fine — the guard makes
+the second bridge yield, so its `listClients` is simply empty (it owns nothing); the page
+stays bound to whichever bridge claimed the folder first.
+
+**Debugging a channel stuck at `connecting`/`bad HMAC`.** weir ships **`weir_mcpDiag`** —
+call it over *any* live channel and it reports, per channel: the folder it's pointed at,
+token presence, and what the page reads from that folder's `bridge.live` (present? session,
+age, fresh?) plus the folder's entries. That splits the three failure modes cleanly: a
+**folder mismatch** (page + bridge on different dirs → `bridgeLive: absent`/stale, no
+`sessions/`), a **key mismatch** (fresh announce but no `sessions/` dir → `bad HMAC`: wrong
+token *or* the §6.3 watch-basename app-id trap), and a healthy channel (`bridgeLive` fresh +
+`entries: [bridge.live, sessions]` + a `clientId`). When in doubt, read the on-disk
+`bridge.live` sig and recompute the HMAC for each candidate app id — that's what pins it.
 
 ---
 
