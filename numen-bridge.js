@@ -725,16 +725,44 @@ function startFsSurface(appId, folder) {
   }).catch((e) => stderr(`fs[${appId}] start failed: ${e.message}`));
 }
 
+// Watch-mode coexistence guard: a WATCH subfolder may already be served by ANOTHER
+// bridge — e.g. a per-folder Claude Code seat on ~/numen/weir while a Desktop bridge
+// watches the parent ~/numen. The fs transport is one-bridge-per-folder (a single
+// bridge.live announce; two writers make the page's announce flap → reconnect churn),
+// so we must NOT clobber a folder a live bridge already owns. Skip any subfolder with a
+// FRESH bridge.live we don't already serve; the owner keeps it, we serve only unclaimed
+// surfaces. Reads just the announce ts (no key needed). Known limitation: handles the
+// common order (the per-folder seat is already live when watch starts); a foreign bridge
+// that appears AFTER we start serving a folder isn't yielded (would need teardown).
+const FS_LIVENESS_MS = 90000;   // matches fs-channel LIVENESS_MS (announce older ⇒ bridge presumed down)
+function hasFreshForeignAnnounce(folder) {
+  try {
+    const ann = JSON.parse(fs.readFileSync(path.join(folder, 'bridge.live'), 'utf8'));
+    const b = JSON.parse(ann.payload);
+    return b && typeof b.ts === 'number' && (Date.now() - b.ts) < FS_LIVENESS_MS;
+  } catch { return false; }   // absent / unparseable ⇒ unclaimed
+}
+
 function startFsBridge() {
   if (WATCH) {
     // Multi-surface: serve every subfolder of WATCH as a surface, rescanning so newly
     // connected apps (their folder created via the page's directory picker) light up.
     stderr(`fs watch mode on ${WATCH} — serving every surface folder there`);
     try { fs.mkdirSync(WATCH, { recursive: true }); } catch (e) { stderr(`could not create ${WATCH}: ${e.message}`); }
+    const yielded = new Set();   // folders logged as foreign-owned (log once, not every 5s scan)
     const scan = () => {
       let entries = [];
       try { entries = fs.readdirSync(WATCH, { withFileTypes: true }); } catch { /* gone */ }
-      for (const e of entries) if (e.isDirectory() && APPID_RE.test(e.name)) startFsSurface(e.name, path.join(WATCH, e.name));
+      for (const e of entries) {
+        if (!e.isDirectory() || !APPID_RE.test(e.name)) continue;
+        const folder = path.join(WATCH, e.name);
+        if (!fsSurfaces.has(e.name) && hasFreshForeignAnnounce(folder)) {   // another live bridge owns it
+          if (!yielded.has(e.name)) { stderr(`fs watch: yielding "${e.name}" — a live foreign bridge owns it`); yielded.add(e.name); }
+          continue;
+        }
+        yielded.delete(e.name);
+        startFsSurface(e.name, folder);
+      }
     };
     scan();
     setInterval(scan, 5000);
