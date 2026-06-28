@@ -131,6 +131,28 @@ const GcuFsChannel = (function () {
     await this._dir.write('bridge.live', rec);
     this._lastAnnounce = ts;
     await this._reapDeadAnnounces(ts);
+    await this._reapDeadSessions();
+  };
+
+  // Sweep stale session dirs (sibling of the live/ reap). A bridge restart mints a NEW session,
+  // orphaning the prior run's sessions/<oldSession>/ tree; old page reconnects leave handshake
+  // litter too. We OWN the folder, so we rmrf any sessions/<X> whose session has no LIVE announce
+  // — never our own, never a co-resident live bridge's (option C / --share): those carry a fresh
+  // live/<X>.json. Session-level only; per-epoch reaping inside our own session is _adoptEpoch's job.
+  FsChannel.prototype._reapDeadSessions = async function () {
+    var live = {};
+    try {
+      var anns = await this._readAnnounces();
+      for (var i = 0; i < anns.length; i++) if (!anns[i].stale) live[anns[i].session] = true;
+    } catch (e) { return; }
+    live[this.session] = true;                                  // never reap our own live session
+    var dirs;
+    try { dirs = await this._dir.list('sessions'); } catch (e) { return; }
+    for (var j = 0; j < dirs.length; j++) {
+      var s = dirs[j];
+      if (!SEG_RE.test(s) || live[s]) continue;                // unsafe name, or a live bridge's session ⇒ keep
+      try { await this._dir.rmrf('sessions/' + s); } catch (e) { /* best effort */ }
+    }
   };
 
   // Sweep clearly-dead peer announces. A bridge restart leaves its old live/<session>.json behind;

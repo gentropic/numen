@@ -31,6 +31,9 @@
 (function () {
   var PROTOCOL = 1;
   var FS_POLL_MS = 350;             // fs-transport poll cadence (reads are cheap; see TRANSPORTS §3.4)
+  var SELFHEAL_MS = 60000;          // slow per-sub re-hello keepalive: re-registers if the bridge ever
+                                    // dropped our client (half-open self-heal). Idempotent on the bridge
+                                    // (re-ack, no churn) when still live; recovers tools when not.
 
   var _tools = new Map();
   var _transport = null;            // { type: 'ws'|'http', ... } — the localhost (single) transport
@@ -311,8 +314,12 @@
       if (next !== entry.state) { entry.state = next; _emitChannel(entry); _recomputeFsState(); }
     }
 
+    function helloMsg() {
+      return { type: 'hello', protocol: PROTOCOL, title: (typeof document !== 'undefined' && document.title) || 'Untitled', name: _effectiveName(), path: (typeof location !== 'undefined' && location.href) || '' };
+    }
+
     function makeSub(session) {
-      var sub = { session: session, channel: null, clientId: null, state: 'connecting' };
+      var sub = { session: session, channel: null, clientId: null, state: 'connecting', helloAt: now() };
       var channel = new FsChannel({
         role: 'page', dir: dir, hmac: hmac, session: session, now: now, randomId: rand,
         onMessage: function (msg) { _handleMessage(msg, function (o) { channel.send(o); }, {
@@ -323,7 +330,7 @@
         onWarn: warn,
       });
       sub.channel = channel;
-      channel.send({ type: 'hello', protocol: PROTOCOL, title: (typeof document !== 'undefined' && document.title) || 'Untitled', name: _effectiveName(), path: (typeof location !== 'undefined' && location.href) || '' });
+      channel.send(helloMsg());
       channel.send({ type: 'tools_changed', tools: _serializeTools(entry.identity) });
       channel.start();   // page start is a noop; the pinned channel mints its epoch on the first tick
       return sub;
@@ -344,6 +351,13 @@
         var dead = [];
         entry.subs.forEach(function (sub, session) { if (!liveSet[session]) dead.push(session); });        // a bridge went away/stale
         for (var k = 0; k < dead.length; k++) { try { entry.subs.get(dead[k]).channel.stop(); } catch (e) {} entry.subs.delete(dead[k]); }
+        entry.subs.forEach(function (sub) {   // slow keepalive → self-heal a half-open (bridge dropped our client but we still read 'connected')
+          if (now() - (sub.helloAt || 0) > SELFHEAL_MS) {   // re-hello re-registers; tools_changed restores tools if the bridge recreated us (or is an old bridge)
+            sub.channel.send(helloMsg());
+            sub.channel.send({ type: 'tools_changed', tools: _serializeTools(entry.identity) });
+            sub.helloAt = now();
+          }
+        });
         var ticks = [];
         entry.subs.forEach(function (sub) { ticks.push(sub.channel.tick()); });
         return Promise.all(ticks).then(function () { reaggregate(staleOnly); });

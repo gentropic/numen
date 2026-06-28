@@ -264,6 +264,7 @@ function cleanupClient(clientId) {
     clearTimeout(client.pollTimer);
   }
   clients.delete(clientId);
+  for (const s of fsSurfaces.values()) if (s.clientId === clientId) s.clientId = null;   // fs: a re-hello will cleanly re-register
   remergeTools();
   stderr(`client ${clientId} disconnected`);
 }
@@ -689,7 +690,16 @@ function makeFsDir(rootDir) {
 function onFsMessage(surface, msg) {
   if (msg.type === 'hello') {
     const clientId = resolveClientId(msg.name || surface.appId, msg.path || '');
-    if (clients.has(clientId)) cleanupClient(clientId);
+    const existing = clients.get(clientId);
+    if (existing && existing.transport === 'fs') {
+      // Idempotent re-hello — the page's slow keepalive for a STILL-LIVE client. Re-ack only; no
+      // cleanup/remerge/log churn. (The keepalive also re-sends tools_changed, but remergeTools
+      // no-ops the list_changed notification when the tool set is unchanged, so it's cheap.)
+      surface.clientId = clientId;
+      sendToClient(existing, { type: 'welcome', protocol: PROTOCOL_VERSION, id: clientId });
+      return;
+    }
+    if (existing) cleanupClient(clientId);   // a stale same-id client of another transport — replace
     const client = {
       id: clientId, transport: 'fs', ws: null,
       send: (obj) => surface.channel.send(obj),
@@ -697,6 +707,9 @@ function onFsMessage(surface, msg) {
     };
     clients.set(clientId, client);
     surface.clientId = clientId;
+    // Fresh OR self-HEALED client (recreated after a drop → empty tools). The keepalive's
+    // accompanying tools_changed restores them, so a recovered channel is never left tool-less —
+    // and this path works against an old bridge too (no needsTools handshake required).
     sendToClient(client, { type: 'welcome', protocol: PROTOCOL_VERSION, id: clientId });
     stderr(`client ${clientId} connected (fs:${surface.appId}): ${client.title}`);
     client.staleTimer = setTimeout(() => {
