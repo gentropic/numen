@@ -113,7 +113,10 @@ function loadOrCreateToken() {
 // (e.g. a Claude Desktop .mcpb) inject a user-set token — kept in the OS keychain by the
 // host and surfaced to the user to paste into the surface — instead of the auto-created
 // ~/.gcu/numen.json one (which a no-shell Desktop user can't read back).
-const sessionToken = argVal('--token', '') || process.env.NUMEN_TOKEN || loadOrCreateToken();
+// .trim() — a pasted token (esp. via the .mcpb / a masked field) often carries a trailing
+// newline/space the user can't see; weir's shim trims its side, so the bridge MUST too, or
+// the HMAC silently never matches (the same correct paste fails identically every time).
+const sessionToken = (argVal('--token', '') || process.env.NUMEN_TOKEN || loadOrCreateToken()).trim();
 
 // fs transport: per-app HMAC key = HKDF-SHA256 of the machine token with an EMPTY salt
 // and info='numen-fs|<appId>' (32 bytes). The info (not the salt) carries the app id,
