@@ -107,6 +107,61 @@ try {
   assert.equal(errors.length, 0, `no page errors (${errors.join('; ')})`);
 
   console.log('browser fs e2e ok:', JSON.stringify(out));
+
+  // ── TWO bridges, ONE folder (shared-folder multichannel) — the SHIM serves both ──
+  const out2 = await page.evaluate(async (TOKEN) => {
+    const FsChannel = window.GcuFsChannel.FsChannel;
+    const opfs = await navigator.storage.getDirectory();
+    const exch = await opfs.getDirectoryHandle('shared-' + Math.random().toString(16).slice(2), { create: true });
+    function fsaDir(root) {
+      const parts = (p) => String(p).split('/').filter(Boolean);
+      async function dirOf(segs, create) { let h = root; for (const s of segs) h = await h.getDirectoryHandle(s, { create: !!create }); return h; }
+      return {
+        async read(name) { const p = parts(name), fn = p.pop(); try { const d = await dirOf(p, false); const fh = await d.getFileHandle(fn); return await (await fh.getFile()).text(); } catch { return null; } },
+        async write(name, str) { const p = parts(name), fn = p.pop(); const d = await dirOf(p, true); const fh = await d.getFileHandle(fn, { create: true }); const w = await fh.createWritable(); try { await w.write(str); } finally { await w.close(); } },
+        async list(dp) { try { const d = await dirOf(parts(dp), false); const out = []; for await (const k of d.keys()) out.push(k); return out; } catch { return []; } },
+        async remove(name) { const p = parts(name), fn = p.pop(); try { const d = await dirOf(p, false); await d.removeEntry(fn); } catch {} },
+        async mkdirp(dp) { await dirOf(parts(dp), true); },
+        async rmrf(dp) { const p = parts(dp), last = p.pop(); try { const d = await dirOf(p, false); await d.removeEntry(last, { recursive: true }); } catch {} },
+      };
+    }
+    async function fsHmac(token, id) {
+      const enc = new TextEncoder();
+      const ikm = await crypto.subtle.importKey('raw', enc.encode(token), 'HKDF', false, ['deriveBits']);
+      const bits = await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: enc.encode('numen-fs|' + id) }, ikm, 256);
+      const key = await crypto.subtle.importKey('raw', bits, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+      return async (str) => { const s = new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(str))); let h = ''; for (const b of s) h += b.toString(16).padStart(2, '0'); return h; };
+    }
+    const hmac = await fsHmac(TOKEN, 'weir');
+    const echoed = {};
+    function makeBridge(label) {
+      const b = new FsChannel({ role: 'bridge', dir: fsaDir(exch), hmac, now: () => Date.now(), randomId: () => Math.random().toString(16).slice(2, 18),
+        onMessage(m) {
+          if (m.type === 'hello') b.send({ type: 'welcome', id: label, protocol: 1 });
+          else if (m.type === 'tools_changed') b.send({ type: 'tool_invoke', callId: 'c-' + label, name: 'echo', input: { text: 'from-' + label } });
+          else if (m.type === 'tool_result') echoed[label] = m.result;
+        } });
+      return b;
+    }
+    const b1 = makeBridge('bridgeA'), b2 = makeBridge('bridgeB');
+    await b1.start(); await b2.start();
+    const bt = setInterval(() => { Promise.resolve().then(() => b1.tick()).then(() => b2.tick()).catch(() => {}); }, 60);
+    const m = window.gcuMCP;
+    m.disconnect();             // drop the single-bridge folder from the first test
+    m.name = 'weir'; m.folder = exch; m.connect(TOKEN);   // 'default' sugar — now N-bridge inside
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline && !(echoed.bridgeA && echoed.bridgeB)) await new Promise((r) => setTimeout(r, 50));
+    clearInterval(bt);
+    return { state: m.state, echoed, channels: m.channels.length };
+  }, 'machine-token-abc123');
+
+  assert.ok(out2.echoed.bridgeA, 'bridge A got its echo — the shim served it from the shared folder');
+  assert.ok(out2.echoed.bridgeB, 'bridge B got its echo — the shim served it TOO, same folder');
+  assert.equal(out2.echoed.bridgeA.echoed, 'from-bridgeA', 'A round-tripped through the shim');
+  assert.equal(out2.echoed.bridgeB.echoed, 'from-bridgeB', 'B round-tripped through the shim');
+  assert.equal(out2.channels, 1, 'still ONE folder entry (N bridges aggregate to one channel row)');
+  console.log('browser fs SHARED-folder e2e ok:', JSON.stringify({ a: !!out2.echoed.bridgeA, b: !!out2.echoed.bridgeB, channels: out2.channels }));
+
   await browser.close();
   process.exit(0);
 } catch (e) {

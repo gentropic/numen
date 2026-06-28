@@ -61,19 +61,29 @@
     }
   }
 
-  function _serializeTools() {
+  // The wire tool list for a given caller identity. A tool may carry `scopeIdentities` (an
+  // array, NOT serialized to the wire) — then it's visible ONLY to channels whose identity is
+  // in it (e.g. dev-only debug tools for claude:dev). Unscoped tools go to everyone. The gate
+  // in _handleInvoke enforces the same at call time (visibility alone isn't a security boundary).
+  function _serializeTools(identity) {
     var tools = [];
     _tools.forEach(function (tool) {
+      if (tool.scopeIdentities && tool.scopeIdentities.indexOf(identity || null) === -1) return;
       tools.push({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema || undefined, annotations: tool.annotations || undefined });
     });
     return tools;
   }
 
-  // Push the current tool list to every live transport (the ws/http one + each fs channel).
+  // Push the current tool list to every live transport — the ws/http one, and each fs SUB-channel
+  // (one per bridge in a folder, multichannel-shared-folder.md), with the list scoped to that
+  // channel's identity.
   function _broadcastToolsChanged() {
-    var payload = { type: 'tools_changed', tools: _serializeTools() };
-    if (_transport && _state === 'connected') _send(payload);
-    _fsChannels.forEach(function (e) { if (e.channel && e.state === 'connected') e.channel.send(payload); });
+    if (_transport && _state === 'connected') _send({ type: 'tools_changed', tools: _serializeTools(_identity) });
+    _fsChannels.forEach(function (e) {
+      e.subs.forEach(function (sub) {
+        if (sub.channel && sub.state === 'connected') sub.channel.send({ type: 'tools_changed', tools: _serializeTools(e.identity) });
+      });
+    });
   }
 
   function _derivedName() {
@@ -264,18 +274,12 @@
     _setState(any ? 'connected' : connecting ? 'connecting' : 'disconnected');
   }
 
-  // Per-channel state/identity context — onWelcome/onError scoped to one fs channel.
-  function _fsCtx(entry) {
-    return {
-      identity: entry.identity,
-      onWelcome: function (id) { entry.clientId = id; entry.state = 'connected'; _emitChannel(entry); _recomputeFsState(); },
-      onError: function () { entry.state = 'error'; _emitChannel(entry); _recomputeFsState(); },
-    };
-  }
-
-  // Add (or replace, idempotent on id) one fs channel over a folder handle. Each
-  // channel runs its own poll loop and shares the page's _tools registry; replies +
-  // identity route per channel via _fsCtx. opts: { id, handle, token, identity }.
+  // Add (or replace, idempotent on id) one fs channel FOLDER. A folder may host MULTIPLE
+  // bridges at once (shared-folder multichannel, docs/multichannel-shared-folder.md): each poll
+  // tick we enumerate the folder's announces (`live/<session>.json`) and run one page SUB-CHANNEL
+  // pinned to each live bridge — all carrying the folder's identity (folder = identity), each its
+  // own clientId. The single-bridge case is just N=1, byte-identical in behaviour. opts:
+  // { id, handle, token, identity }.
   async function _addFolder(opts) {
     var FsChannel = _fsChannelCtor();
     if (!FsChannel) throw new Error('fs transport needs fs-channel.js (global GcuFsChannel) on the page');
@@ -285,39 +289,65 @@
     if (!opts || !opts.handle) throw new Error('addFolder needs a directory handle');
     if (!token) throw new Error('addFolder needs the machine token');
     _removeFolder(id);   // idempotent: re-adding an id replaces it
-    var entry = { id: id, handle: opts.handle, token: token, identity: opts.identity || null, channel: null, clientId: null, state: 'connecting', timer: null, polling: true };
+    var hmac = await _fsHmac(token, _effectiveName());
+    var dir = _fsaDir(opts.handle);
+    var now = function () { return Date.now(); };
+    var rand = function () { return _randHex(8); };
+    var warn = function (m) { if (typeof console !== 'undefined') console.warn('[numen] fs[' + id + ']:', m); };
+    var entry = { id: id, handle: opts.handle, token: token, identity: opts.identity || null, subs: new Map(), clientId: null, state: 'connecting', timer: null, polling: true };
     _fsChannels.set(id, entry);
     _emitChannel(entry); _recomputeFsState();
-    var hmac = await _fsHmac(token, _effectiveName());
-    var channel = new FsChannel({
-      role: 'page', dir: _fsaDir(opts.handle), hmac: hmac,
-      now: function () { return Date.now(); },
-      randomId: function () { return _randHex(8); },
-      onMessage: function (msg) { _handleMessage(msg, function (o) { channel.send(o); }, _fsCtx(entry)); },
-      onState: function (s) {
-        // entry.state is normally driven by the app-level handshake (onWelcome→connected /
-        // onError→error); the channel transport states we surface are: 'closed'→disconnected,
-        // and 'offline' (bridge.live heartbeat stale → bridge process down) so the host can show
-        // it honestly instead of an eternal "connecting". 'open' after 'offline' = the bridge
-        // returned → back to handshaking ('connecting'; onWelcome will re-confirm 'connected').
-        var next = s === 'closed' ? 'disconnected'
-          : s === 'offline' ? 'offline'
-          : (s === 'open' && entry.state === 'offline') ? 'connecting'
-          : null;
-        if (next && next !== entry.state) { entry.state = next; _emitChannel(entry); _recomputeFsState(); }
-      },
-      onWarn: function (m) { if (typeof console !== 'undefined') console.warn('[numen] fs[' + id + ']:', m); },
-    });
-    entry.channel = channel;
-    channel.send({ type: 'hello', protocol: PROTOCOL, title: (typeof document !== 'undefined' && document.title) || 'Untitled', name: _effectiveName(), path: (typeof location !== 'undefined' && location.href) || '' });
-    channel.send({ type: 'tools_changed', tools: _serializeTools() });
-    await channel.start();
+
+    // a page channel used ONLY to enumerate the folder's live bridges (no session, never ticked)
+    var scanner = new FsChannel({ role: 'page', dir: dir, hmac: hmac, now: now, randomId: rand, onWarn: warn });
+
+    // Aggregate the sub-channels into the entry's state (one row per folder for the host UI):
+    // connected if ANY bridge connected; offline if the only announce(s) are stale (bridge down);
+    // else connecting. Emit only on a real change (mirrors the pre-multichannel behaviour).
+    function reaggregate(staleOnly) {
+      var any = false; entry.clientId = null;
+      entry.subs.forEach(function (s) { if (s.state === 'connected') { any = true; if (!entry.clientId) entry.clientId = s.clientId; } });
+      var next = any ? 'connected' : (entry.subs.size ? 'connecting' : (staleOnly ? 'offline' : 'connecting'));
+      if (next !== entry.state) { entry.state = next; _emitChannel(entry); _recomputeFsState(); }
+    }
+
+    function makeSub(session) {
+      var sub = { session: session, channel: null, clientId: null, state: 'connecting' };
+      var channel = new FsChannel({
+        role: 'page', dir: dir, hmac: hmac, session: session, now: now, randomId: rand,
+        onMessage: function (msg) { _handleMessage(msg, function (o) { channel.send(o); }, {
+          identity: entry.identity,
+          onWelcome: function (cid) { sub.clientId = cid; sub.state = 'connected'; reaggregate(); },
+          onError: function () { sub.state = 'error'; reaggregate(); },
+        }); },
+        onWarn: warn,
+      });
+      sub.channel = channel;
+      channel.send({ type: 'hello', protocol: PROTOCOL, title: (typeof document !== 'undefined' && document.title) || 'Untitled', name: _effectiveName(), path: (typeof location !== 'undefined' && location.href) || '' });
+      channel.send({ type: 'tools_changed', tools: _serializeTools(entry.identity) });
+      channel.start();   // page start is a noop; the pinned channel mints its epoch on the first tick
+      return sub;
+    }
+
     var busy = false;
     entry.timer = setInterval(function () {
       if (busy || !entry.polling) return;
       busy = true;
-      Promise.resolve().then(function () { return channel.tick(); })
-        .catch(function (e) { if (typeof console !== 'undefined') console.error('[numen] fs[' + id + '] tick', e); })
+      Promise.resolve().then(function () { return scanner._readAnnounces(); }).then(function (all) {
+        var liveSet = {}, staleOnly = all.length > 0;
+        for (var i = 0; i < all.length; i++) {
+          if (all[i].stale) continue;
+          staleOnly = false;
+          liveSet[all[i].session] = true;
+          if (!entry.subs.has(all[i].session)) entry.subs.set(all[i].session, makeSub(all[i].session));   // a NEW bridge appeared
+        }
+        var dead = [];
+        entry.subs.forEach(function (sub, session) { if (!liveSet[session]) dead.push(session); });        // a bridge went away/stale
+        for (var k = 0; k < dead.length; k++) { try { entry.subs.get(dead[k]).channel.stop(); } catch (e) {} entry.subs.delete(dead[k]); }
+        var ticks = [];
+        entry.subs.forEach(function (sub) { ticks.push(sub.channel.tick()); });
+        return Promise.all(ticks).then(function () { reaggregate(staleOnly); });
+      }).catch(function (e) { if (typeof console !== 'undefined') console.error('[numen] fs[' + id + '] tick', e); })
         .then(function () { busy = false; });
     }, FS_POLL_MS);
     return entry;
@@ -328,7 +358,7 @@
     if (!e) return;
     e.polling = false;
     if (e.timer) { clearInterval(e.timer); e.timer = null; }
-    if (e.channel) { try { e.channel.stop(); } catch (x) { /* ignore */ } }
+    if (e.subs) e.subs.forEach(function (s) { try { s.channel.stop(); } catch (x) { /* ignore */ } });
     _fsChannels.delete(id);
     e.state = 'disconnected'; _emitChannel(e);
     _recomputeFsState();
@@ -346,6 +376,9 @@
   function _handleInvoke(msg, reply, identity) {
     var tool = _tools.get(msg.name);
     if (!tool) { reply({ type: 'tool_result', callId: msg.callId, error: 'Tool not found: ' + msg.name }); return; }
+    if (tool.scopeIdentities && tool.scopeIdentities.indexOf(identity || null) === -1) {   // scoped tool, wrong identity — hidden AND ungated
+      reply({ type: 'tool_result', callId: msg.callId, error: 'Tool not available to ' + (identity || 'this client') + ': ' + msg.name }); return;
+    }
     // `identity` is the calling channel's (folder = identity) — carried into execution
     // so a tool can attribute the write (SPEC-librarian §2). null on ws/http.
     var client = { requestUserInteraction: function (cb) { return cb(); }, identity: identity || null };
@@ -442,7 +475,7 @@
     notify: function (method, params) {
       var obj = { type: 'notification', method: method, params: params };
       if (_transport) _send(obj);
-      _fsChannels.forEach(function (e) { if (e.channel) e.channel.send(obj); });
+      _fsChannels.forEach(function (e) { e.subs.forEach(function (s) { if (s.channel) s.channel.send(obj); }); });
     },
     get state() { return _state; },
     get clientId() { return _clientId; },
