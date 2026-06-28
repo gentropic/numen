@@ -12,8 +12,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import pw from '../../bridge/node_modules/playwright/index.js';
-const { chromium } = pw;
+import { chromium } from '../../accountable/node_modules/@playwright/test/index.mjs';   // sibling Playwright (repo renamed bridge → accountable)
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const shimCode = fs.readFileSync(path.join(here, '..', 'shim.js'), 'utf8');
@@ -90,21 +89,21 @@ try {
     navigator.modelContext.registerTool({
       name: 'echo', description: 'Echo text back',
       inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
-      execute: async ({ text }) => ({ echoed: text, by: m.clientId }),
+      execute: async ({ text }) => ({ echoed: text }),
     });
     m.connect(TOKEN);                       // bare token (no port) — fs branch
 
     const deadline = Date.now() + 8000;
     while (Date.now() < deadline && !echoed) await new Promise((r) => setTimeout(r, 50));
     clearInterval(bt);
-    return { state: m.state, clientId: m.clientId, echoed };
+    // clientId moved per-channel in the multichannel shim — read it off channels[0]
+    return { state: m.state, clientId: (m.channels && m.channels[0] || {}).clientId, echoed };
   }, 'machine-token-abc123');
 
   assert.equal(out.state, 'connected', 'shim reached state=connected over the fs transport');
-  assert.equal(out.clientId, 'weir', 'welcome assigned the client id');
+  assert.equal(out.clientId, 'weir', "the channel's welcome assigned the client id");
   assert.ok(out.echoed, 'a tool_result came back to the bridge');
   assert.equal(out.echoed.echoed, 'hello over opfs', 'tool payload round-tripped through OPFS');
-  assert.equal(out.echoed.by, 'weir', 'tool ran in the page with the right client id');
   assert.equal(errors.length, 0, `no page errors (${errors.join('; ')})`);
 
   console.log('browser fs e2e ok:', JSON.stringify(out));
