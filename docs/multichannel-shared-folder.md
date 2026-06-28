@@ -89,9 +89,14 @@ So:
 - **Litter.** A bridge restart leaves a stale `live/<oldsession>.json` (the page filters stale by
   `ts`, so it's ignored — just litter). A TTL reap of clearly-dead announces is a Phase 2 nicety
   (same "never rmrf unverified input" rule as epoch reaping).
-- **The §6.3 coexistence guard becomes mostly moot** for shared folders: bridges no longer fight
-  over one `bridge.live`, so they don't need to yield. The guard stays for the *watch-keys-by-
-  basename* topology, but "two bridges, one folder" is now first-class, not a hazard.
+- **The §6.3 coexistence guard + `--share` (BUILT 2026-06-27, `smoke-fs-share.mjs`).** Per-bridge
+  announces removed the clobber, so two bridges *can* share a folder — but the watch guard still
+  yields **by default** (one bridge per folder), because relaxing it unconditionally would let a
+  watch over an *overlapping* parent serve other seats' folders (identity leak). So co-residency is
+  **opt-in: `--share` / `NUMEN_SHARE`** makes watch co-serve instead of yield (the `.mcpb` surfaces it
+  as a checkbox, default off). Two Claude Desktop sessions both driving one surface = `--share` + a
+  **dedicated** parent (`~/numen-cowork`). This was the capstone that made C's same-identity-many-
+  bridges payoff reach Desktop seats, not just single-folder Code bridges.
 
 ## 5. Build plan
 

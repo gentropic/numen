@@ -427,7 +427,16 @@ so a Desktop watch over a parent can run *alongside* the per-folder Claude Code 
 common order — the per-folder bridge is already live when watch starts; a foreign bridge
 that appears *after* watch has claimed a folder isn't yet yielded, which would need surface
 teardown. And don't run two *watch* bridges over the same parent — they can race the first
-scan.) This is the only change to `numen-bridge.js` the multichannel arc required.
+scan.)
+
+**`--share` — opt into CO-RESIDENCY (option C, `smoke-fs-share.mjs`).** The guard above keeps the
+default "one bridge per folder." With **`--share`** / `NUMEN_SHARE` the watch bridge **co-serves**
+folders other bridges already serve instead of yielding — so **N bridges share one folder** (e.g.
+two Claude Desktop sessions both driving one surface), each writing its own `live/<session>.json`
+announce, the page running one sub-channel per bridge (§6.5). Safe now that per-bridge announces
+removed the clobber — but **only over a DEDICATED parent** holding just your own surfaces
+(`~/numen-cowork`), since with `--share` the bridge no longer declines another seat's folder. The
+`.mcpb` exposes this as the **"Allow multiple sessions to share a folder"** checkbox (default off).
 
 **⚠ Watch × multichannel keying — a sharp edge.** Watch keys a folder by its **basename**
 (= app id). But a §6.5 multichannel surface keys *every* channel by the **page's app name**

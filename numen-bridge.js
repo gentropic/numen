@@ -65,6 +65,14 @@ const FOLDER = expandHome(argVal('--folder', '') || process.env.NUMEN_FOLDER
 // (→ its per-app key). Defaults to ~/numen when fs mode is requested with no --app/--folder.
 const WATCH = expandHome(argVal('--watch', '') || process.env.NUMEN_WATCH
   || (TRANSPORT === 'fs' && !FOLDER ? '~/numen' : ''));
+// Co-residency (option C — docs/multichannel-shared-folder.md). By DEFAULT watch mode yields a
+// subfolder another live bridge already owns (the coexistence guard: one bridge per folder).
+// With --share / NUMEN_SHARE it CO-SERVES instead — N bridges share a folder via per-bridge
+// `live/<session>.json` announces (the page runs one sub-channel each, all the folder's identity);
+// e.g. two Claude Desktop sessions both driving one surface. Safe ONLY when the watched parent
+// holds your OWN surfaces (a DEDICATED parent like ~/numen-cowork) — over a parent that also holds
+// OTHER seats' folders it would serve those too, under this bridge's reach.
+const SHARE = process.argv.includes('--share') || /^(1|true|yes|on)$/i.test(process.env.NUMEN_SHARE || '');
 const FS_POLL_MS = parseInt(argVal('--poll', ''), 10) || 200;
 const ALLOW = (argVal('--allow', '') || '*').split(',').map((s) => s.trim()).filter(Boolean);
 
@@ -747,7 +755,7 @@ function startFsBridge() {
   if (WATCH) {
     // Multi-surface: serve every subfolder of WATCH as a surface, rescanning so newly
     // connected apps (their folder created via the page's directory picker) light up.
-    stderr(`fs watch mode on ${WATCH} — serving every surface folder there`);
+    stderr(`fs watch mode on ${WATCH} — serving every surface folder there${SHARE ? ' (--share: CO-SERVING, N bridges per folder)' : ''}`);
     try { fs.mkdirSync(WATCH, { recursive: true }); } catch (e) { stderr(`could not create ${WATCH}: ${e.message}`); }
     const yielded = new Set();   // folders logged as foreign-owned (log once, not every 5s scan)
     const scan = () => {
@@ -756,8 +764,10 @@ function startFsBridge() {
       for (const e of entries) {
         if (!e.isDirectory() || !APPID_RE.test(e.name)) continue;
         const folder = path.join(WATCH, e.name);
-        if (!fsSurfaces.has(e.name) && hasFreshForeignAnnounce(folder)) {   // another live bridge owns it
-          if (!yielded.has(e.name)) { stderr(`fs watch: yielding "${e.name}" — a live foreign bridge owns it`); yielded.add(e.name); }
+        // --share (option C): co-serve — N bridges share a folder via per-bridge live/<session>.json.
+        // Default: yield a folder another live bridge already owns (one bridge per folder).
+        if (!SHARE && !fsSurfaces.has(e.name) && hasFreshForeignAnnounce(folder)) {   // another live bridge owns it
+          if (!yielded.has(e.name)) { stderr(`fs watch: yielding "${e.name}" — a live foreign bridge owns it (pass --share to co-serve)`); yielded.add(e.name); }
           continue;
         }
         yielded.delete(e.name);
