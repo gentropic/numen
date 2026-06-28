@@ -130,6 +130,29 @@ const GcuFsChannel = (function () {
     await this._dir.write('live/' + this.session + '.json', rec);
     await this._dir.write('bridge.live', rec);
     this._lastAnnounce = ts;
+    await this._reapDeadAnnounces(ts);
+  };
+
+  // Sweep clearly-dead peer announces. A bridge restart leaves its old live/<session>.json behind;
+  // the PAGE can't remove a foreign one (it may not hold the key to verify it), so litter piles up
+  // and the page re-rejects each every poll tick (bad-HMAC spam) forever. We OWN the folder, so we
+  // remove any live/ announce far past the liveness window. A live bridge refreshes within
+  // LIVENESS_MS, so this never touches a co-resident bridge (option C / --share). ts-based, NOT
+  // HMAC — the wrong-token litter we most want gone is exactly what we can't verify.
+  FsChannel.prototype._reapDeadAnnounces = async function (now) {
+    var names;
+    try { names = await this._dir.list('live'); } catch (e) { return; }
+    for (var i = 0; i < names.length; i++) {
+      if (!/\.json$/.test(names[i]) || names[i] === this.session + '.json') continue;   // skip non-json + our own
+      var raw;
+      try { raw = await this._dir.read('live/' + names[i]); } catch (e) { continue; }
+      if (raw == null) continue;
+      var b;
+      try { b = JSON.parse(JSON.parse(raw).payload); } catch (e) { continue; }          // unparseable → leave it
+      if (typeof b.ts === 'number' && (now - b.ts) > LIVENESS_MS * 2) {                  // far past liveness ⇒ dead
+        try { await this._dir.remove('live/' + names[i]); } catch (e) { /* best effort */ }
+      }
+    }
   };
 
   // Read + verify EVERY announce in the folder (`live/<session>.json` + legacy `bridge.live`),
