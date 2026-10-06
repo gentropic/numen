@@ -164,7 +164,7 @@ function resolveClientId(name, path) {
 
 // ── Minimal WebSocket server (RFC 6455, text frames, localhost) ──
 
-const WS_MAGIC = '258EAFA5-E914-47DA-95CA-5AB5DC85B11';
+const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';   // RFC 6455 §1.3 — one mistyped char here meant NO compliant client ever completed the WS handshake (everything fell back to HTTP long-poll, silently)
 
 function computeAcceptKey(key) {
   return crypto.createHash('sha1').update(key + WS_MAGIC).digest('base64');
